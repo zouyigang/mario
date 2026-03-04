@@ -1,0 +1,10 @@
+# 马里奥 SB3 + Gymnasium 训练依赖
+gymnasium>=1.0.0
+stable-baselines3[extra]>=2.0.0
+gym-super-mario-bros>=7.4.0
+nes-py>=8.2.0
+shimmy>=1.0.0
+opencv-python>=4.5.0
+gym>=0.26.0
+# NumPy 2.x 与 matplotlib/SB3 依赖的 C 扩展不兼容，需使用 1.x
+numpy>=1.21.0,<2.0.0

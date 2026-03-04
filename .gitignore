@@ -1,0 +1,11 @@
+# 训练日志与模型（不同步到 git）
+sb3_mario_logs/
+
+# Python 缓存
+__pycache__/
+
+# IDE
+.idea/
+
+# 虚拟环境
+.venv/
