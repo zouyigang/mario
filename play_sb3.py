@@ -28,7 +28,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 # 配置（与训练时一致才能正确加载）
 # ======================
 # 演示用环境：v1 分辨率更清晰便于观看；训练仍用 train_sb3.py 里的 MARIO_ENV_ID（如 v3）
-PLAY_ENV_ID = "SuperMarioBros-1-4-v1"
+PLAY_ENV_ID = "SuperMarioBros-2-2-v1"
 # 模型路径：默认用训练脚本保存的路径；也可改为 best: ./sb3_mario_logs/best/best_model.zip
 MODEL_PATH = "./sb3_mario_model.zip"
 # 若训练时用的是 DQN，改为 "DQN" 并用 DQN.load

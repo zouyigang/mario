@@ -133,6 +133,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFram
 # 算法与回调
 from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
+from stable_baselines3.common.utils import get_linear_fn
 
 # Gymnasium 包装器基类（用于自定义 wrapper）
 from gymnasium import Wrapper
@@ -140,7 +141,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-1-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
+MARIO_ENV_ID = "SuperMarioBros-2-2-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
@@ -157,11 +158,18 @@ DEATH_PENALTY_SEEN = 15           # 死亡步惩罚；与正常步 ±1 保持合
 # 接着训：要加载的模型路径；可改为 checkpoints/mario_XXX_steps.zip 指定某一轮
 LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
 # 本轮再训练的步数
-ADDITIONAL_TIMESTEPS = 2_000_000   # 保守：不宜过大，配合早停避免后期崩
+ADDITIONAL_TIMESTEPS = 4_000_000   # 继续训步数；2M 常不够收敛，4M 让红线有足够时间提升
 # 加载后覆盖到模型上的熵系数与学习率（保守：小值微调，降低训崩风险）
 ENT_COEF_CONTINUE = 0.02
 LR_CONTINUE = 1e-4
+LR_CONTINUE_END = 3e-5   # 继续训末期学习率；线性衰减利于后期收敛
+USE_LR_DECAY_CONTINUE = True   # True=学习率从 LR_CONTINUE 线性降到 LR_CONTINUE_END
 ALGORITHM = "PPO"   # 须与 checkpoint 保存时的算法一致（"PPO" 或 "DQN"）
+# 继续训时也沿用与从头训一致的 PPO 超参，利于收敛、少抖（加载后覆盖到模型上）
+PPO_N_STEPS = 512
+PPO_BATCH_SIZE = 1024
+PPO_N_EPOCHS = 3
+PPO_CLIP_RANGE = 0.18       # 与从头训一致；0.18 略放宽利于收敛
 # 早停：当 rollout 平均奖励相对「历史最高」明显下降时提前结束，保留峰值附近的策略
 EARLY_STOP_ENABLED = False   # 保守版默认开启，防止接着训太久导致分数崩盘
 EARLY_STOP_RATIO = 0.90     # 保守：0.90 稍宽松，避免轻微波动就停
@@ -621,7 +629,16 @@ def main():
         if getattr(model, "ent_coef", None) is not None:
             model.ent_coef = ENT_COEF_CONTINUE
         if getattr(model, "learning_rate", None) is not None:
-            model.learning_rate = LR_CONTINUE
+            model.learning_rate = (
+                get_linear_fn(LR_CONTINUE, LR_CONTINUE_END, end_fraction=0.0)
+                if USE_LR_DECAY_CONTINUE else LR_CONTINUE
+            )
+        # 与从头训一致的 PPO 超参，继续训时也改用稳收敛配置
+        model.n_steps = PPO_N_STEPS
+        model.batch_size = PPO_BATCH_SIZE
+        model.n_epochs = PPO_N_EPOCHS
+        # SB3 内部会调用 clip_range(progress_remaining)，必须为 callable，不能直接赋 float
+        model.clip_range = lambda _: PPO_CLIP_RANGE
 
     eval_env = DummyVecEnv([make_env])
     eval_env = VecFrameStack(eval_env, n_stack=FRAME_STACK)
@@ -631,7 +648,7 @@ def main():
         best_model_save_path=os.path.join(SAVE_DIR, "best"),
         log_path=SAVE_DIR,
         eval_freq=max(EVAL_FREQ // NUM_ENVS, 1),
-        n_eval_episodes=5,
+        n_eval_episodes=20,
         deterministic=True,
         verbose=0,
     )

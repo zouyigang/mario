@@ -131,6 +131,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFram
 # 算法与回调
 from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
+from stable_baselines3.common.utils import get_linear_fn
 
 # Gymnasium 包装器基类（用于自定义 wrapper）
 from gymnasium import Wrapper
@@ -138,7 +139,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-1-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
+MARIO_ENV_ID = "SuperMarioBros-2-2-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
@@ -156,8 +157,15 @@ DEATH_PENALTY_SEEN = 15           # 死亡步惩罚；与正常步 ±1 不要差
 TOTAL_TIMESTEPS = 5_000_000   # 激进版：可改为 5_000_000 等更长训练
 # 从头训 PPO 的熵系数与学习率
 ENT_COEF = 0.01            # 熵系数，PPO 默认 0.01；0.8 会让策略永远随机无法收敛
-LR = 3e-4                   # 学习率
+LR = 1e-4                   # 学习率（线性衰减时的起始值）
+LR_END = 3e-5               # 训练末期学习率；线性衰减让后期更新变小，利于收敛、减少震荡
+USE_LR_DECAY = True         # True=学习率从 LR 线性降到 LR_END；False=恒定 LR
 ALGORITHM = "PPO"   # "PPO" 或 "DQN"
+# PPO 收敛与稳定性：更大 rollout + 更保守更新 → 曲线更稳、易收敛
+PPO_N_STEPS = 512          # 每次更新前采样的步数；256→512 梯度更稳
+PPO_BATCH_SIZE = 1024       # 每批样本数，建议 ≥ n_steps*num_envs 的约数
+PPO_N_EPOCHS = 3            # 每批 rollout 重复训练轮数；4→3 减轻过拟合、减少震荡
+PPO_CLIP_RANGE = 0.18       # 策略更新裁剪；0.15 过保守可能难收敛，0.18 略放宽仍较稳
 # 早停：当 rollout 平均奖励相对「历史最高」明显下降时提前结束，保留峰值附近的策略
 EARLY_STOP_ENABLED = False  # 是否启用早停
 EARLY_STOP_RATIO = 0.88     # 当前奖励 < 历史最高 * 此比例 时计一次「下降」；0.88～0.90 更敏感
@@ -574,16 +582,17 @@ def main():
     env = VecFrameStack(env, n_stack=FRAME_STACK)
 
     if ALGORITHM.upper() == "PPO":
+        lr = get_linear_fn(LR, LR_END, end_fraction=0.0) if USE_LR_DECAY else LR
         model = PPO(
             "CnnPolicy",
             env,
-            learning_rate=LR,
-            n_steps=256,
-            batch_size=512,
-            n_epochs=4,
+            learning_rate=lr,
+            n_steps=PPO_N_STEPS,
+            batch_size=PPO_BATCH_SIZE,
+            n_epochs=PPO_N_EPOCHS,
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
+            clip_range=PPO_CLIP_RANGE,
             ent_coef=ENT_COEF,
             verbose=0,
             tensorboard_log=os.path.join(SAVE_DIR, "tensorboard"),
@@ -613,7 +622,7 @@ def main():
         best_model_save_path=os.path.join(SAVE_DIR, "best"),
         log_path=SAVE_DIR,
         eval_freq=max(EVAL_FREQ // NUM_ENVS, 1),
-        n_eval_episodes=5,
+        n_eval_episodes=20,
         deterministic=True,
         verbose=0,
     )
