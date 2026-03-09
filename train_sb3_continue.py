@@ -141,7 +141,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-2-2-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
+MARIO_ENV_ID = "SuperMarioBros-3-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
@@ -161,8 +161,8 @@ LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
 ADDITIONAL_TIMESTEPS = 4_000_000   # 继续训步数；2M 常不够收敛，4M 让红线有足够时间提升
 # 加载后覆盖到模型上的熵系数与学习率（保守：小值微调，降低训崩风险）
 ENT_COEF_CONTINUE = 0.02
-LR_CONTINUE = 1e-4
-LR_CONTINUE_END = 3e-5   # 继续训末期学习率；线性衰减利于后期收敛
+LR_CONTINUE = 3e-5
+LR_CONTINUE_END = 1e-5   # 继续训末期学习率；线性衰减利于后期收敛
 USE_LR_DECAY_CONTINUE = True   # True=学习率从 LR_CONTINUE 线性降到 LR_CONTINUE_END
 ALGORITHM = "PPO"   # 须与 checkpoint 保存时的算法一致（"PPO" 或 "DQN"）
 # 继续训时也沿用与从头训一致的 PPO 超参，利于收敛、少抖（加载后覆盖到模型上）
@@ -199,7 +199,7 @@ NO_PROGRESS_PENALTY_AFTER = 60   # 滑动窗口步数（约 4 秒）；窗口内
 NO_PROGRESS_MIN_DX_IN_WINDOW = 80 # 窗口内至少前进多少像素才不算无进展（约 0.83 px/步）；120 过于严格，正常跑步都可能被误判
 NO_PROGRESS_PENALTY_SEEN = 0.8   # 每步扣除的奖励（小负值，避免与死亡惩罚混淆；0.5 让前进+1 变 0.5，原地 0 变 -0.5）
 # 每步时间/步数惩罚：每步额外扣除此值，步数越多总奖励越低，促使尽快过关（0=关闭）
-STEP_PENALTY_SEEN = 0.15          # 每步扣 0.05；0.2 太重——500 步就扣 100 分，几乎抵消所有前进奖励
+STEP_PENALTY_SEEN = 0.1          # 每步扣 0.05；0.2 太重——500 步就扣 100 分，几乎抵消所有前进奖励
 
 # ======================
 # 奖励函数说明（gym_super_mario_bros 环境 + 可选裁剪）
@@ -622,17 +622,19 @@ def main():
         print("已备份当前 best_model → {}".format(backup_path))
 
     print("从 checkpoint 继续训练: {}".format(LOAD_CHECKPOINT))
+    # 加载时用 custom_objects 替换学习率：checkpoint 里可能保存了 end_fraction=0 的 schedule，会在 load 内除零
+    _lr_schedule = (
+        get_linear_fn(LR_CONTINUE, LR_CONTINUE_END, end_fraction=1.0)
+        if USE_LR_DECAY_CONTINUE else (lambda _: LR_CONTINUE)
+    )
     if ALGORITHM.upper() == "DQN":
         model = DQN.load(LOAD_CHECKPOINT, env=env)
     else:
-        model = PPO.load(LOAD_CHECKPOINT, env=env)
+        model = PPO.load(LOAD_CHECKPOINT, env=env, custom_objects={"learning_rate": _lr_schedule})
         if getattr(model, "ent_coef", None) is not None:
             model.ent_coef = ENT_COEF_CONTINUE
         if getattr(model, "learning_rate", None) is not None:
-            model.learning_rate = (
-                get_linear_fn(LR_CONTINUE, LR_CONTINUE_END, end_fraction=0.0)
-                if USE_LR_DECAY_CONTINUE else LR_CONTINUE
-            )
+            model.learning_rate = _lr_schedule
         # 与从头训一致的 PPO 超参，继续训时也改用稳收敛配置
         model.n_steps = PPO_N_STEPS
         model.batch_size = PPO_BATCH_SIZE
@@ -648,7 +650,7 @@ def main():
         best_model_save_path=os.path.join(SAVE_DIR, "best"),
         log_path=SAVE_DIR,
         eval_freq=max(EVAL_FREQ // NUM_ENVS, 1),
-        n_eval_episodes=20,
+        n_eval_episodes=1,   # 确定性策略+固定环境，每轮结果相同，1 轮即可
         deterministic=True,
         verbose=0,
     )
