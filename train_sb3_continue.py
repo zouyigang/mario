@@ -141,9 +141,9 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-3-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
+MARIO_ENV_ID = "SuperMarioBros-4-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
-MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
+MOVEMENT_ACTIONS = COMPLEX_MOVEMENT
 NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
 USE_SUBPROC_VEC_ENV = True   # True=多进程真并行（更多 env 能加速）；False=DummyVecEnv（兼容性好，Windows/NES 更稳）
 FRAME_SKIP = 4
