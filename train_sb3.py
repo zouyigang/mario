@@ -139,7 +139,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-4-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
+MARIO_ENV_ID = "SuperMarioBros-5-2-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
 MOVEMENT_ACTIONS = COMPLEX_MOVEMENT
 NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
@@ -154,7 +154,7 @@ CLIP_REWARD_EXCEPT_DEATH = True   # True=死亡步不裁剪，用 DEATH_PENALTY_
 DEATH_REWARD_THRESHOLD = -15      # 原始 reward <= 此值视为死亡步（勿设成 -300，否则 -25 永远不触发）
 DEATH_PENALTY_SEEN = 15           # 死亡步惩罚；与正常步 ±1 不要差距太大，否则方差太大 value function 难学
 # 总训练步数
-TOTAL_TIMESTEPS = 8_000_000   # 激进版：可改为 5_000_000 等更长训练
+TOTAL_TIMESTEPS = 20_000_000   # 激进版：可改为 5_000_000 等更长训练
 # 从头训 PPO 的熵系数与学习率
 ENT_COEF = 0.01            # 熵系数，PPO 默认 0.01；0.8 会让策略永远随机无法收敛
 LR = 1e-4                   # 学习率（线性衰减时的起始值）
