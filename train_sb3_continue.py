@@ -166,6 +166,7 @@ ENT_COEF_CONTINUE = 0.02
 LR_CONTINUE = 1e-4
 LR_CONTINUE_END = 3e-5   # 继续训末期学习率；线性衰减利于后期收敛
 USE_LR_DECAY_CONTINUE = True   # True=学习率从 LR_CONTINUE 线性降到 LR_CONTINUE_END
+LR_CONTINUE_DECAY_END_FRACTION = 1.0  # 学习率在继续训练进度的多少比例内衰减到末值；必须 > 0
 ALGORITHM = "PPO"   # 须与 checkpoint 保存时的算法一致（"PPO" 或 "DQN"）
 # 继续训时也沿用与从头训一致的 PPO 超参，利于收敛、少抖（加载后覆盖到模型上）
 PPO_N_STEPS = 512
@@ -209,11 +210,20 @@ TELEPORT_IMMEDIATE_DX = 100        # 立即回传最小后退像素
 TELEPORT_IMMEDIATE_STEPS = 3       # 立即回传检测窗口步数
 TELEPORT_BRANCH_MIN_DISTANCE = 50  # 分支回传：回退到至少多少步前的位置
 TELEPORT_BRANCH_TOLERANCE = 20     # 分支回传位置容差（像素）
+TELEPORT_BRANCH_RELAX_TOLERANCE = 80
+TELEPORT_BRANCH_LARGE_JUMP_MIN_DELTA = 250
+TELEPORT_FRAME_SIM_THRESHOLD = 0.12
+TELEPORT_WRAP_PREV_X_MIN = 900
+TELEPORT_WRAP_CURR_X_MAX = 320
 # 回传惩罚参数（在 ClipRewardExceptDeath 层处理，回传优先于死亡判定）
 TELEPORT_IMMEDIATE_PENALTY = 20    # 立即回传惩罚（比死亡更严重，鼓励避开触发传送的动作）
 TELEPORT_BRANCH_BASE_PENALTY = 8   # 分支回传基础惩罚
 TELEPORT_ESCALATION = 1.5          # 递增系数：第N次回传惩罚 = base × 1.5^(N-1)，越错越重
 WRONG_BRANCH_STEP_CLAWBACK = 0.8   # 错误路段步数回扣：走错路每步扣回 0.8，抵消走错路段积累的正奖励
+# 回传 Replay 录制（用于人工回看判断检测是否准确）
+SAVE_TELEPORT_REPLAYS = True                                    # 是否保存回传 episode 的原始画面
+TELEPORT_REPLAY_DIR = "./sb3_mario_logs/teleport_replays"       # replay 保存目录
+TELEPORT_REPLAY_MAX_COUNT = 50                                  # 最多保留多少条 replay（超出后删最旧的）
 
 # ======================
 # 奖励函数说明（gym_super_mario_bros 环境 + 可选裁剪）
@@ -331,31 +341,53 @@ class DeadLoopDetector(Wrapper):
     可选 penalty：该步 reward 减去 penalty，让「关尾超时」比「真正过关」回报低。
     无进展/慢速判定（供 ClipReward 扣分）：采用滑动窗口——最近 window 步内总位移若 < min_dx_in_window，
     则设 info["no_progress"]，这样关尾小跳蹭步（每几步才动 8 像素）也会被罚，且各关卡通用。
+
+    坐标回绕时重置横向锚点与滑动窗口，避免误判循环超时。
     """
 
     def __init__(self, env, no_progress_max_steps, min_dx, penalty=0,
-                 no_progress_penalty_after=0, no_progress_min_dx_in_window=0):
+                 no_progress_penalty_after=0, no_progress_min_dx_in_window=0,
+                 wrap_prev_x_min=900, wrap_curr_x_max=320, wrap_min_drop=100):
         super().__init__(env)
         self._no_progress_max = no_progress_max_steps
         self._min_dx = min_dx
         self._penalty = max(0, float(penalty))
         self._window = max(0, int(no_progress_penalty_after))
         self._min_dx_in_window = max(0, int(no_progress_min_dx_in_window))
+        self._wrap_prev_x_min = int(wrap_prev_x_min)
+        self._wrap_curr_x_max = int(wrap_curr_x_max)
+        self._wrap_min_drop = int(wrap_min_drop)
         self._x_anchor = 0
+        self._last_x = 0
         self._no_progress_steps = 0
         self._x_history = deque(maxlen=self._window) if self._window > 0 else None
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._x_anchor = _get_mario_x_from_env(self.env)
+        self._last_x = self._x_anchor
         self._no_progress_steps = 0
         if self._x_history is not None:
             self._x_history.clear()
         return obs, info
 
+    def _is_coordinate_wrap_step(self, prev_x, current_x):
+        if prev_x < self._wrap_prev_x_min:
+            return False
+        if current_x > self._wrap_curr_x_max:
+            return False
+        if prev_x - current_x < self._wrap_min_drop:
+            return False
+        return True
+
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         current_x = _get_mario_x_from_env(self.env)
+        if self._is_coordinate_wrap_step(self._last_x, current_x):
+            self._x_anchor = current_x
+            self._no_progress_steps = 0
+            if self._x_history is not None:
+                self._x_history.clear()
         # 死循环截断：仅当 no_progress_max > 0 时生效
         if self._no_progress_max > 0:
             if current_x - self._x_anchor >= self._min_dx:
@@ -375,6 +407,7 @@ class DeadLoopDetector(Wrapper):
                 dx_in_window = current_x - self._x_history[0]
                 if dx_in_window < self._min_dx_in_window:
                     info["no_progress"] = True
+        self._last_x = current_x
         return obs, reward, terminated, truncated, info
 
 
@@ -416,10 +449,10 @@ class ClipRewardExceptDeathWrapper(Wrapper):
         teleport_count = info.get("teleport_count", 0)
 
         if is_teleport_immediate:
-            escalation = self._teleport_escalation ** max(0, teleport_count - 1)
+            escalation = min(self._teleport_escalation ** max(0, teleport_count - 1), 100.0)
             reward = -(self._teleport_immediate_penalty * escalation)
         elif is_teleport_branch:
-            escalation = self._teleport_escalation ** max(0, teleport_count - 1)
+            escalation = min(self._teleport_escalation ** max(0, teleport_count - 1), 100.0)
             base = self._teleport_branch_base_penalty * escalation
             wrong_steps = info.get("wrong_branch_steps", 0)
             clawback = wrong_steps * self._wrong_branch_step_clawback
@@ -485,6 +518,9 @@ def make_env(env_id=None):
             penalty=DEAD_LOOP_PENALTY,
             no_progress_penalty_after=NO_PROGRESS_PENALTY_AFTER,
             no_progress_min_dx_in_window=NO_PROGRESS_MIN_DX_IN_WINDOW,
+            wrap_prev_x_min=TELEPORT_WRAP_PREV_X_MIN,
+            wrap_curr_x_max=TELEPORT_WRAP_CURR_X_MAX,
+            wrap_min_drop=TELEPORT_IMMEDIATE_DX,
         )
 
     # 帧跳过（同 Atari）
@@ -503,6 +539,14 @@ def make_env(env_id=None):
             immediate_teleport_steps=TELEPORT_IMMEDIATE_STEPS,
             branch_teleport_min_distance=TELEPORT_BRANCH_MIN_DISTANCE,
             branch_teleport_tolerance=TELEPORT_BRANCH_TOLERANCE,
+            branch_relax_tolerance=TELEPORT_BRANCH_RELAX_TOLERANCE,
+            branch_large_jump_min_delta=TELEPORT_BRANCH_LARGE_JUMP_MIN_DELTA,
+            frame_similarity_threshold=TELEPORT_FRAME_SIM_THRESHOLD,
+            wrap_prev_x_min=TELEPORT_WRAP_PREV_X_MIN,
+            wrap_curr_x_max=TELEPORT_WRAP_CURR_X_MAX,
+            save_replays=SAVE_TELEPORT_REPLAYS,
+            replay_dir=TELEPORT_REPLAY_DIR,
+            replay_max_count=TELEPORT_REPLAY_MAX_COUNT,
         )
     if CLIP_REWARD:
         if CLIP_REWARD_EXCEPT_DEATH:
@@ -683,8 +727,9 @@ def main():
         if getattr(model, "ent_coef", None) is not None:
             model.ent_coef = ENT_COEF_CONTINUE
         if getattr(model, "learning_rate", None) is not None:
+            lr_decay_fraction = max(float(LR_CONTINUE_DECAY_END_FRACTION), 1e-8)
             model.learning_rate = (
-                get_linear_fn(LR_CONTINUE, LR_CONTINUE_END, end_fraction=0.0)
+                get_linear_fn(LR_CONTINUE, LR_CONTINUE_END, end_fraction=lr_decay_fraction)
                 if USE_LR_DECAY_CONTINUE else LR_CONTINUE
             )
         # 与从头训一致的 PPO 超参，继续训时也改用稳收敛配置
