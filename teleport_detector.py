@@ -110,11 +110,16 @@ class TeleportBackDetector(Wrapper):
         current_x = self._get_mario_x()
 
         is_immediate = self._detect_immediate_teleport(current_x)
-        is_branch, wrong_steps = self._detect_branch_teleport(current_x)
+        is_branch = False
+        wrong_steps = 0
+        if not is_immediate:
+            is_branch, wrong_steps = self._detect_branch_teleport(current_x)
 
         if is_immediate:
             self._teleport_count += 1
             info["teleport_immediate"] = True
+            self._x_history.clear()
+            self._short_x_history.clear()
 
         if is_branch:
             self._teleport_count += 1
@@ -122,6 +127,8 @@ class TeleportBackDetector(Wrapper):
             self._steps_since_last_branch_start = 0
             info["teleport_branch"] = True
             info["wrong_branch_steps"] = wrong_steps
+            self._x_history.clear()
+            self._short_x_history.clear()
 
         info["teleport_count"] = self._teleport_count
 

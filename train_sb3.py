@@ -141,7 +141,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-2-2-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
+MARIO_ENV_ID = "SuperMarioBros-4-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
@@ -156,12 +156,13 @@ CLIP_REWARD_EXCEPT_DEATH = True   # True=死亡步不裁剪，用 DEATH_PENALTY_
 DEATH_REWARD_THRESHOLD = -15      # 原始 reward <= 此值视为死亡步（勿设成 -300，否则 -25 永远不触发）
 DEATH_PENALTY_SEEN = 15           # 死亡步惩罚；与正常步 ±1 不要差距太大，否则方差太大 value function 难学
 # 总训练步数
-TOTAL_TIMESTEPS = 5_000_000   # 激进版：可改为 5_000_000 等更长训练
+TOTAL_TIMESTEPS = 20_000_000   # 激进版：可改为 5_000_000 等更长训练
 # 从头训 PPO 的熵系数与学习率
 ENT_COEF = 0.01            # 熵系数，PPO 默认 0.01；0.8 会让策略永远随机无法收敛
 LR = 1e-4                   # 学习率（线性衰减时的起始值）
 LR_END = 3e-5               # 训练末期学习率；线性衰减让后期更新变小，利于收敛、减少震荡
 USE_LR_DECAY = True         # True=学习率从 LR 线性降到 LR_END；False=恒定 LR
+LR_DECAY_END_FRACTION = 1.0 # 学习率在训练进度的多少比例内衰减到 LR_END；必须 > 0（1.0=全程线性衰减）
 ALGORITHM = "PPO"   # "PPO" 或 "DQN"
 # PPO 收敛与稳定性：更大 rollout + 更保守更新 → 曲线更稳、易收敛
 PPO_N_STEPS = 512          # 每次更新前采样的步数；256→512 梯度更稳
@@ -393,10 +394,10 @@ class ClipRewardExceptDeathWrapper(Wrapper):
         teleport_count = info.get("teleport_count", 0)
 
         if is_teleport_immediate:
-            escalation = self._teleport_escalation ** max(0, teleport_count - 1)
+            escalation = min(self._teleport_escalation ** max(0, teleport_count - 1), 100.0)
             reward = -(self._teleport_immediate_penalty * escalation)
         elif is_teleport_branch:
-            escalation = self._teleport_escalation ** max(0, teleport_count - 1)
+            escalation = min(self._teleport_escalation ** max(0, teleport_count - 1), 100.0)
             base = self._teleport_branch_base_penalty * escalation
             wrong_steps = info.get("wrong_branch_steps", 0)
             clawback = wrong_steps * self._wrong_branch_step_clawback
@@ -636,7 +637,9 @@ def main():
     env = VecFrameStack(env, n_stack=FRAME_STACK)
 
     if ALGORITHM.upper() == "PPO":
-        lr = get_linear_fn(LR, LR_END, end_fraction=0.0) if USE_LR_DECAY else LR
+        # SB3 的 get_linear_fn 会除以 end_fraction，必须保证 > 0，避免 ZeroDivisionError
+        lr_decay_fraction = max(float(LR_DECAY_END_FRACTION), 1e-8)
+        lr = get_linear_fn(LR, LR_END, end_fraction=lr_decay_fraction) if USE_LR_DECAY else LR
         model = PPO(
             "CnnPolicy",
             env,
