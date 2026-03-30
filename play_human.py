@@ -120,8 +120,74 @@ else:
         return 0
 
 
+def _format_episode_exit_reason(terminated, truncated, info):
+    """
+    与 train_sb3.EpisodeLogCallback 判定优先级一致，并补充 Gym 状态与其它 info。
+    """
+    if info.get("dead_loop"):
+        tag = "循环超时（死循环检测：长时间横向无足够进展）"
+    elif info.get("flag_get"):
+        tag = "到达终点（拿旗）"
+    elif info.get("teleport_immediate"):
+        tag = "立即回传"
+    elif info.get("teleport_branch"):
+        tag = "分支回传（走错路/画面相似回落，wrong_branch_steps={}）".format(
+            info.get("wrong_branch_steps", "?")
+        )
+    elif terminated:
+        tag = "游戏内终止（多为死亡或生命耗尽，且非拿旗）"
+    elif truncated:
+        tag = "截断（环境或包装器 truncated，且非死循环/回传标记）"
+    else:
+        tag = "未知"
+
+    parts = [
+        tag,
+        "terminated={} truncated={}".format(terminated, truncated),
+    ]
+    mx = info.get("episode_max_x")
+    if mx is not None:
+        parts.append("MaxX={}".format(mx))
+    tc = info.get("teleport_count")
+    if tc is not None:
+        parts.append("teleport_count={}".format(tc))
+    if info.get("coordinate_wrap"):
+        parts.append("末帧coordinate_wrap")
+    if info.get("correct_wrap_new_area"):
+        parts.append("末帧correct_wrap_new_area")
+    if info.get("no_progress"):
+        parts.append("末帧no_progress")
+    return " | ".join(parts)
+
+
+def _hud_flag_lines(info):
+    """当前步 info 里与训练相关的标记（最后一帧可对照退出原因）。"""
+    lines = []
+    if info.get("flag_get"):
+        lines.append("flag_get")
+    if info.get("dead_loop"):
+        lines.append("dead_loop")
+    if info.get("teleport_branch"):
+        lines.append(
+            "teleport_branch ws={}".format(info.get("wrong_branch_steps", ""))
+        )
+    if info.get("teleport_immediate"):
+        lines.append("teleport_immediate")
+    if info.get("correct_wrap_new_area"):
+        lines.append("correct_wrap_new_area")
+    if info.get("coordinate_wrap"):
+        lines.append("coordinate_wrap")
+    if info.get("no_progress"):
+        lines.append("no_progress")
+    return lines
+
+
 def _draw_hud(x: int, step_r: float, total_r: float, action: int, lines_extra=None):
-    h, w = 140, 520
+    base_h = 140
+    line_h = 22
+    extra_n = len(lines_extra) if lines_extra else 0
+    h = min(base_h + max(0, extra_n - 2) * line_h, 260)
+    w = 520
     img = np.zeros((h, w, 3), dtype=np.uint8)
     img[:] = (40, 40, 40)
     name = (
@@ -179,15 +245,8 @@ def main():
             total_r += r
 
             x = _get_mario_x_from_env(env)
-            extra = []
-            if info.get("flag_get"):
-                extra.append("FLAG / cleared!")
-            if info.get("dead_loop"):
-                extra.append("dead_loop timeout")
-            if info.get("teleport_branch"):
-                extra.append("teleport_branch")
-
-            _draw_hud(x, r, total_r, int(action), extra if extra else None)
+            flag_lines = _hud_flag_lines(info)
+            _draw_hud(x, r, total_r, int(action), flag_lines if flag_lines else None)
 
             if gym_render is not None:
                 try:
@@ -199,12 +258,12 @@ def main():
                 time.sleep(min(float(FRAME_DELAY_SEC), 0.2))
 
             if terminated or truncated:
+                reason = _format_episode_exit_reason(terminated, truncated, info)
                 print(
-                    "本局结束 | 步数: {} | 总奖励: {:.2f} | flag_get={} dead_loop={}".format(
+                    "本局结束 | 步数: {} | 总奖励: {:.2f}\n  原因: {}".format(
                         steps,
                         total_r,
-                        info.get("flag_get", False),
-                        info.get("dead_loop", False),
+                        reason,
                     )
                 )
                 obs, info = env.reset()
