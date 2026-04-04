@@ -141,12 +141,12 @@ from gymnasium import Wrapper
 # ======================
 MARIO_ENV_ID = "SuperMarioBros-5-3-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
-MOVEMENT_ACTIONS = COMPLEX_MOVEMENT
+MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
 USE_SUBPROC_VEC_ENV = True   # True=多进程真并行（更多 env 能加速）；False=DummyVecEnv（兼容性好，Windows/NES 更稳）
-FRAME_SKIP = 4
-FRAME_SIZE = 84
-FRAME_STACK = 4
+FRAME_SKIP = 4      # MaxAndSkip：同一动作重复执行多少帧再采样一次（越大决策越稀疏、训练越快，但可能丢细节）
+FRAME_SIZE = 84     # WarpFrame：灰度图缩放边长（像素），Atari/CNN 常用 84×84
+FRAME_STACK = 4     # VecFrameStack：堆叠最近多少帧作为观测（通道维表示短时运动/速度信息）
 CLIP_REWARD = True   # True=每步奖励裁剪为 +1/0/-1（见下方奖励说明）
 # 死亡那步不裁剪，保留明显负值让智能体更好学到「避免死亡」
 CLIP_REWARD_EXCEPT_DEATH = True   # True=死亡步不裁剪，用 DEATH_PENALTY_SEEN；False=与普通步一样裁成 -1
