@@ -125,7 +125,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数（极简经典配置）
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-1-1-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
+MARIO_ENV_ID = "SuperMarioBros-5-3-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT       # 7 个动作：含 NOOP/左/右/跳/跑跳，等待和后退都需要
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
@@ -143,6 +143,12 @@ FLAG_GET_BONUS = 50           # 通关额外奖励，远大于死亡惩罚，鼓
 DEAD_LOOP_STEPS = 500        # 约 33 秒无进展才结束（为传送台/电梯留足时间）
 DEAD_LOOP_MIN_DX = 8
 DEAD_LOOP_PENALTY_SEEN = 5
+
+# 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
+# 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
+# BASE 要大于「该关正常快通步数 + 可能出现的蹭分步数」，否则快通已贴顶、蹭分只靠多走 +1 会反超
+SPEED_BONUS_BASE_STEPS = 700
+SPEED_BONUS_PER_STEP = 1.5
 
 # PPO 超参
 ENT_COEF = 0.01
@@ -215,26 +221,33 @@ class DeadLoopDetector(Wrapper):
 
 class SimpleRewardWrapper(Wrapper):
     """
-    极简奖励：
+    极简奖励 + 通关速度奖励：
     - 正常步：np.sign(reward) → +1(前进) / 0(原地) / -1(后退)
-    - 死亡步：-death_penalty（仅在真正死亡时触发）
+    - 死亡步：-death_penalty
     - 死循环超时：-dead_loop_penalty
-    - 通关：+flag_bonus
-
-    核心设计理念：原地等待 reward=0，完全不扣分！
-    这样智能体在悬崖边等传送台时不会被"时间焦虑"逼着跳崖。
+    - 通关：flag_bonus + max(0, speed_base_steps - 已用步数) × speed_per_step
+      越快通关奖励越高，每多蹭一步就少拿 speed_per_step 分（>1.0 时蹭分严格亏损）
     """
 
     def __init__(self, env, death_threshold=-15, death_penalty=15,
-                 dead_loop_penalty=5, flag_bonus=50):
+                 dead_loop_penalty=5, flag_bonus=50,
+                 speed_base_steps=500, speed_per_step=1.5):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
         self._death_penalty = float(death_penalty)
         self._dead_loop_penalty = float(dead_loop_penalty)
         self._flag_bonus = float(flag_bonus)
+        self._speed_base = int(speed_base_steps)
+        self._speed_per_step = float(speed_per_step)
+        self._steps = 0
+
+    def reset(self, **kwargs):
+        self._steps = 0
+        return self.env.reset(**kwargs)
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self._steps += 1
 
         is_dead_loop = info.get("dead_loop", False)
         is_flag = info.get("flag_get", False)
@@ -250,7 +263,8 @@ class SimpleRewardWrapper(Wrapper):
         elif is_death:
             reward = -self._death_penalty
         elif is_flag:
-            reward = self._flag_bonus
+            speed_bonus = max(0, self._speed_base - self._steps) * self._speed_per_step
+            reward = self._flag_bonus + speed_bonus
         else:
             reward = float(np.sign(reward))
 
@@ -286,6 +300,8 @@ def make_env(env_id=None):
         death_penalty=DEATH_PENALTY_SEEN,
         dead_loop_penalty=DEAD_LOOP_PENALTY_SEEN,
         flag_bonus=FLAG_GET_BONUS,
+        speed_base_steps=SPEED_BONUS_BASE_STEPS,
+        speed_per_step=SPEED_BONUS_PER_STEP,
     )
     env = Monitor(env)
     return env
@@ -438,7 +454,8 @@ class EpisodeLogCallback(BaseCallback):
                 if info.get("dead_loop"):
                     suffix = "  [循环超时]"
                 elif info.get("flag_get"):
-                    suffix = "  [到达终点]"
+                    speed_b = max(0, SPEED_BONUS_BASE_STEPS - int(l)) * SPEED_BONUS_PER_STEP
+                    suffix = "  [到达终点 速度奖励+{:.0f}]".format(speed_b)
                 else:
                     suffix = "  [死亡/其他]"
                 ec = getattr(self.model, "ent_coef", None)
@@ -516,8 +533,8 @@ def main():
     print("🚀 开始训练（SB3 + PPO + 马里奥，从头训）...")
     print("关卡: {} | 动作集: {} 个 | 帧跳过: {} | 并行环境: {}".format(
         MARIO_ENV_ID, len(MOVEMENT_ACTIONS), FRAME_SKIP, NUM_ENVS))
-    print("奖励: 前进+1 | 原地等待0 | 后退-1 | 死亡-{} | 通关+{}".format(
-        DEATH_PENALTY_SEEN, FLAG_GET_BONUS))
+    print("奖励: 前进+1 | 原地0 | 后退-1 | 死亡-{} | 通关+{}+速度奖励(基准{}步,每省1步+{})".format(
+        DEATH_PENALTY_SEEN, FLAG_GET_BONUS, SPEED_BONUS_BASE_STEPS, SPEED_BONUS_PER_STEP))
     print("本轮将训练 {} 步".format(TOTAL_TIMESTEPS))
     print("Episode 列 | ent=当前 PPO 熵系数（自适应回调会动态修改）")
     print("-" * 88)
