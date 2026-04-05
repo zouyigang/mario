@@ -38,6 +38,22 @@ N_EPISODES = 5
 # 每步渲染后延迟（秒），越大动画越慢；0=最快。例如 0.04 约 25 帧/秒，0.08 约 12 帧/秒
 FRAME_DELAY_SEC = 0.06
 
+
+def _episode_end_tag(info):
+    """与 train_sb3 里 Monitor / 包装器 写入的 info 对齐，返回统一前缀。"""
+    if not info:
+        return "[未知]"
+    if info.get("teleport_back"):
+        return "[回传终止]"
+    if info.get("dead_loop"):
+        return "[循环超时]"
+    if info.get("flag_get"):
+        return "[到达终点]"
+    if info.get("TimeLimit.truncated"):
+        return "[时间到]"
+    return "[死亡/其他]"
+
+
 # ======================
 # 加载模型与环境
 # ======================
@@ -68,6 +84,7 @@ def main():
         print("无法获取游戏窗口，将仅运行推理（无画面）")
 
     print("开始 AI 演示（确定性策略），关闭窗口或 Ctrl+C 可退出")
+    print("日志格式：[结束类型] 本局步数：N  总奖励：R")
     print("-" * 50)
 
     episode = 0
@@ -79,9 +96,12 @@ def main():
         total_reward = 0
         steps = 0
         done = False
+        last_info = {}
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, rewards, dones, infos = env.step(action)
+            if infos:
+                last_info = infos[0]
             if gym_env is not None:
                 try:
                     gym_env.render(mode="human")
@@ -92,16 +112,10 @@ def main():
             total_reward += float(rewards[0])
             steps += 1
             done = dones[0]
-            if infos and infos[0].get("flag_get"):
-                print("  [到达终点] 本局步数: {}  总奖励: {:.1f}".format(steps, total_reward))
-                break
-            if infos and infos[0].get("dead_loop"):
-                print("  [循环超时] 本局步数: {}  总奖励: {:.1f}".format(steps, total_reward))
-                break
 
         episode += 1
-        if not (infos and (infos[0].get("flag_get") or infos[0].get("dead_loop"))):
-            print("Episode {} 结束 | 步数: {} | 总奖励: {:.1f}".format(episode, steps, total_reward))
+        end_tag = _episode_end_tag(last_info)
+        print("{} 本局步数：{}  总奖励：{:.1f}".format(end_tag, steps, total_reward))
 
         if N_EPISODES > 0 and episode >= N_EPISODES:
             break
