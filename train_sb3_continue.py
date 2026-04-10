@@ -171,7 +171,8 @@ DYN_ENT_ENABLED = True
 DYN_ENT_MAX = 0.12              # 从 0.08 → 0.12，卡住时允许更高探索
 DYN_ENT_NO_PROGRESS_STEPS = 300_000  # frame_skip 2→步数×2；原 150k
 DYN_ENT_BOOST_STEP = 0.01
-DYN_ENT_DECAY_FACTOR = 0.7     # 从 0.6 → 0.7，衰减更慢，保持探索时间更长
+DYN_ENT_MIN = 0.03             # 熵系数下限；迷宫需要持续探索，不能低于此值
+DYN_ENT_DECAY_FACTOR = 0.85    # 从 0.7 → 0.85，衰减更慢，迷宫分支需要长期保持探索
 LR_CONTINUE = 3e-4              # 从 1e-4 → 3e-4，比初训还高，打破僵局
 LR_CONTINUE_END = 5e-5          # 从 3e-5 → 5e-5，末期仍有更新能力
 USE_LR_DECAY_CONTINUE = True   # True=学习率从 LR_CONTINUE 线性降到 LR_CONTINUE_END
@@ -228,10 +229,10 @@ BACKTRACK_GRACE_STEPS = 4          # frame_skip 2→步数×2；原 2
 BACKTRACK_SINGLE_STEP_MAX = 200    # 像素值，不需要翻倍
 # 回传惩罚参数（在 ClipRewardExceptDeath 层处理，与 train_sb3 一致）
 TELEPORT_IMMEDIATE_PENALTY = 20    # 与 train 常量对齐；当前 Clip 层未使用 teleport_immediate
-TELEPORT_BRANCH_BASE_PENALTY = 18  # 从 12 → 18，走错路回传基础惩罚更重
-WRONG_BRANCH_STEP_CLAWBACK = 0.25  # frame_skip 2→每步÷2；原 0.5，步数翻倍后总回扣不变
-MAX_CLAWBACK = 20.0                 # 从 15 → 20，错误路上花的步数扣得更狠；最大惩罚=18+20=38
-CORRECT_WRAP_BONUS = 10.0           # 从 5 → 10，走对路坐标回绕时给更大正奖励
+TELEPORT_BRANCH_BASE_PENALTY = 40  # 从 25 → 40，走错路回传基础惩罚必须远超探索收益
+WRONG_BRANCH_STEP_CLAWBACK = 0.8   # 从 0.4 → 0.8，错误路上每步回扣更快，抵消格子探索奖励
+MAX_CLAWBACK = 60.0                 # 从 30 → 60；最大惩罚=40+60=100，远超错路探索总收益
+CORRECT_WRAP_BONUS = 15.0           # 从 10 → 15，走对路奖励进一步拉开
 # 回传 Replay 录制（用于人工回看判断检测是否准确）
 SAVE_TELEPORT_REPLAYS = False                                   # 是否保存回传 episode 的原始画面
 TELEPORT_REPLAY_DIR = "./sb3_mario_logs/teleport_replays"       # replay 保存目录
@@ -242,12 +243,16 @@ MAZE_MODE = True           # True = 迷宫模式；False = 原直线模式，行
 
 # ---- 格子探索 ----
 CELL_SIZE = 16             # 格子大小（像素）
-CELL_VISIT_BONUS = 2.0     # 从 1.0 → 2.0，探索新格子奖励翻倍
+CELL_VISIT_BONUS = 2.0     # 探索新格子奖励；往左+往右差距不能太大（往右≤往左×3）
+ENV_REWARD_SCALE = 0.4     # 往右时的环境奖励权重；避免向右激励过强（+5 → +2）
 CELL_REVISIT_REWARD = -0.01  # frame_skip 2→÷2；原 -0.02
 MAZE_STALL_PENALTY = 0.1     # frame_skip 2→÷2；原 0.2
 MAZE_STALL_ESCALATE_PER_STEP = 0.0075  # frame_skip 2→÷2；原 0.015
 MAZE_STALL_ESCALATE_CAP = 2.0
 FRONTIER_BONUS = 0.3
+# ---- 纵向探索奖励（鼓励往下跳到新层，4-4 迷宫正确路径关键）----
+Y_LAYER_BONUS = 3.0          # 首次到达新 Y 层时额外奖励，引导向下探索
+Y_LAYER_SIZE = 32            # Y 层划分粒度（像素）
 
 # ---- 迷宫无进展惩罚（替代原 NO_PROGRESS_* 的 x 轴版本）----
 MAZE_NO_NEW_CELL_STEPS = 70      # frame_skip 2→步数×2；原 35
@@ -385,7 +390,9 @@ class CellExplorationWrapper(Wrapper):
                  revisit_reward=0.0,
                  no_new_cell_steps=80,
                  dead_loop_steps=150,
-                 frontier_bonus=0.0):
+                 frontier_bonus=0.0,
+                 y_layer_bonus=0.0,
+                 y_layer_size=32):
         super().__init__(env)
         self._cell_size = int(cell_size)
         self._visit_bonus = float(visit_bonus)
@@ -393,7 +400,10 @@ class CellExplorationWrapper(Wrapper):
         self._no_new_cell_steps = int(no_new_cell_steps)
         self._dead_loop_steps = int(dead_loop_steps)
         self._frontier_bonus = float(frontier_bonus)
+        self._y_layer_bonus = float(y_layer_bonus)
+        self._y_layer_size = int(y_layer_size)
         self._visited = set()
+        self._visited_y_layers = set()
         self._steps_without_new = 0
         self._last_cell = None
         self._same_cell_steps = 0
@@ -404,11 +414,13 @@ class CellExplorationWrapper(Wrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._visited.clear()
+        self._visited_y_layers.clear()
         self._steps_without_new = 0
         x = _get_mario_x_from_env(self.env)
         y = _get_mario_y_from_env(self.env)
         start_cell = self._cell(x, y)
         self._visited.add(start_cell)
+        self._visited_y_layers.add(y // self._y_layer_size)
         self._last_cell = start_cell
         self._same_cell_steps = 0
         return obs, info
@@ -421,6 +433,17 @@ class CellExplorationWrapper(Wrapper):
         prev_cell = self._last_cell
         cell_changed = prev_cell is not None and cell != prev_cell
         info["cell_changed"] = cell_changed
+
+        # Y 层探索奖励：首次到达新的 Y 层时给额外奖励，引导纵向移动（下跳）
+        y_layer = y // self._y_layer_size
+        if self._y_layer_bonus > 0 and y_layer not in self._visited_y_layers:
+            self._visited_y_layers.add(y_layer)
+            reward += self._y_layer_bonus
+            info["new_y_layer"] = True
+            info["y_layer_bonus_given"] = self._y_layer_bonus  # 供 ClipReward 层读取，避免被覆盖
+        else:
+            info["new_y_layer"] = False
+            info["y_layer_bonus_given"] = 0.0
 
         if cell not in self._visited:
             self._visited.add(cell)
@@ -477,6 +500,8 @@ class ClipRewardExceptDeathWrapper(Wrapper):
                  max_clawback=25.0,
                  correct_wrap_bonus=5.0,
                  maze_mode=False,
+                 maze_new_cell_reward=0.0,
+                 env_reward_scale=1.0,
                  maze_no_progress_penalty=0.3,
                  maze_stall_penalty=0.2,
                  maze_stall_escalate_per_step=0.015,
@@ -493,11 +518,20 @@ class ClipRewardExceptDeathWrapper(Wrapper):
         self._max_clawback = float(max_clawback)
         self._correct_wrap_bonus = float(correct_wrap_bonus)
         self._maze_mode = bool(maze_mode)
+        self._maze_new_cell_reward = float(maze_new_cell_reward)
+        self._env_reward_scale = float(env_reward_scale)
         self._maze_no_progress_penalty = float(maze_no_progress_penalty)
         self._maze_stall_penalty = float(maze_stall_penalty)
         self._maze_stall_escalate_per_step = float(maze_stall_escalate_per_step)
         self._maze_stall_escalate_cap = float(maze_stall_escalate_cap)
         self._maze_step_penalty = float(maze_step_penalty)
+        # 本局累积的正奖励（含格子探索/Y层奖励/前沿奖励等），死亡时一锅端 clawback
+        self._episode_positive_accum = 0.0
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._episode_positive_accum = 0.0
+        return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
@@ -520,18 +554,36 @@ class ClipRewardExceptDeathWrapper(Wrapper):
         elif is_dead_loop:
             reward = -self._dead_loop_penalty
 
-        # 优先级 4：死亡
+        # 优先级 4：死亡（一锅端 clawback：吐出本局累积正奖励 + 基础死亡惩罚）
         elif (reward <= self._death_threshold
               or (terminated and not info.get("flag_get", False))):
-            reward = -self._death_penalty
+            reward = -(self._death_penalty + self._episode_positive_accum)
+            info["death_clawback"] = float(self._episode_positive_accum)
 
         # 优先级 5：正常步
         elif self._maze_mode:
             frontier_add = float(info.get("frontier_reward", 0.0) or 0.0)
+            # 上游 CellExplorationWrapper 叠加的额外奖励（Y层奖励等），需要保留
+            extra_bonus = float(info.get("y_layer_bonus_given", 0.0))
             if info.get("new_cell", False):
-                reward = max(reward, 0.0)
+                # 修复方向偏见：环境 reward ≥ 0 时衰减保留，否则用固定奖励
+                if reward >= 0:
+                    # 往右走、得到正向位移：衰减环境奖励 + cell 探索奖励
+                    # 衰减避免向右激励过强（+5 → +2），确保往左探索不会被完全压制
+                    reward = reward * self._env_reward_scale + self._maze_new_cell_reward
+                else:
+                    # 往左走、得到负向位移：用固定奖励代替（避免方向偏见）
+                    reward = self._maze_new_cell_reward
+                reward += extra_bonus  # 加上 Y_LAYER_BONUS
             elif info.get("cell_changed", False):
-                reward = float(info.get("maze_revisit_reward", 0.0)) + frontier_add
+                # 移动到已访问格子时，也考虑方向：往右走（正向）应该比往左走更有利
+                base_revisit = float(info.get("maze_revisit_reward", 0.0))
+                if reward >= 0:
+                    # 往右/往下：小正值而非负值（鼓励快速前进，即使是老路）
+                    reward = max(base_revisit, 0.0) + frontier_add
+                else:
+                    # 往左/往上：保持负值（避免无限往回走）
+                    reward = base_revisit + frontier_add
             else:
                 same_steps = int(info.get("same_cell_steps", 0))
                 escalated = min(
@@ -553,6 +605,12 @@ class ClipRewardExceptDeathWrapper(Wrapper):
                 reward -= self._no_progress_penalty
             if self._step_penalty > 0:
                 reward -= self._step_penalty
+
+        # 本局累积正奖励：终局清零，非终局正奖励累加
+        if terminated or truncated:
+            self._episode_positive_accum = 0.0
+        elif reward > 0:
+            self._episode_positive_accum += float(reward)
 
         return obs, reward, terminated, truncated, info
 
@@ -625,6 +683,8 @@ def make_env(env_id=None):
             no_new_cell_steps=MAZE_NO_NEW_CELL_STEPS,
             dead_loop_steps=MAZE_DEAD_LOOP_STEPS,
             frontier_bonus=FRONTIER_BONUS,
+            y_layer_bonus=Y_LAYER_BONUS,
+            y_layer_size=Y_LAYER_SIZE,
         )
 
         if ENABLE_TELEPORT_DETECTION:
@@ -656,6 +716,8 @@ def make_env(env_id=None):
                 max_clawback=MAX_CLAWBACK,
                 correct_wrap_bonus=CORRECT_WRAP_BONUS,
                 maze_mode=True,
+                maze_new_cell_reward=CELL_VISIT_BONUS,
+                env_reward_scale=ENV_REWARD_SCALE,
                 maze_no_progress_penalty=MAZE_NO_PROGRESS_PENALTY,
                 maze_stall_penalty=MAZE_STALL_PENALTY,
                 maze_stall_escalate_per_step=MAZE_STALL_ESCALATE_PER_STEP,
@@ -806,35 +868,41 @@ class EarlyStoppingOnRewardDrop(BaseCallback):
 
 class DynamicEntCoefCallback(BaseCallback):
     """
-    动态熵系数：基于 rollout 平均奖励的滑动窗口最大值判断是否有进展。
+    动态熵系数：基于 rollout 平均奖励判断是否有进展，含 plateau 检测。
 
     逻辑：
     - 收集最近 reward_window 个 episode 的奖励，计算滑动平均
     - 滑动平均创新高 → ent_coef 快速衰减回基础值（策略在进步，减少探索）
-    - 连续 no_progress_steps 步滑动平均未创新高 → ent_coef += boost_step（策略停滞，增加探索）
-
-    为什么用滑动窗口而非实时值：
-    - 防止"熵↑→探索多→短期reward↓→触发更高熵"的正反馈死循环
-    - 滑动窗口平滑了短期波动，只对持续性的进步/停滞做出反应
+    - 连续 no_progress_steps 步未创新高 → ent_coef += boost_step（停滞，增加探索）
+    - plateau 检测：即使 reward 还在缓慢上升，如果涨幅小于阈值也视为平台期，
+      用较小的 boost 推动探索，防止 agent 满足于"走到分支点就被回传"的稳定策略
     """
 
     def __init__(self, base_ent_coef=0.05, max_ent_coef=0.15,
+                 min_ent_coef=0.01,
                  no_progress_steps=300_000, boost_step=0.01,
-                 decay_factor=0.6, reward_window=100, verbose=1):
+                 decay_factor=0.6, reward_window=100,
+                 plateau_check_steps=200_000, plateau_min_gain=50.0,
+                 verbose=1):
         super().__init__(verbose)
         self._base = float(base_ent_coef)
+        self._min = float(min_ent_coef)
         self._max = float(max_ent_coef)
         self._no_progress_steps = int(no_progress_steps)
         self._boost_step = float(boost_step)
         self._decay_factor = float(decay_factor)
         self._reward_window = int(reward_window)
+        self._plateau_check_steps = int(plateau_check_steps)
+        self._plateau_min_gain = float(plateau_min_gain)
         self._recent_rewards = []
         self._best_avg_reward = -float("inf")
         self._last_best_timestep = 0
         self._current_ent = float(base_ent_coef)
+        # plateau 检测：记录上次检查点的 avg_reward
+        self._plateau_last_avg = -float("inf")
+        self._plateau_last_check_step = 0
 
     def _on_step(self) -> bool:
-        # 收集每个 episode 结束时的总奖励
         for info in self.locals.get("infos", []):
             ep_info = info.get("episode")
             if ep_info is not None:
@@ -842,7 +910,6 @@ class DynamicEntCoefCallback(BaseCallback):
                 if len(self._recent_rewards) > self._reward_window:
                     self._recent_rewards.pop(0)
 
-        # 至少积累一半窗口的数据再开始判断
         if len(self._recent_rewards) < self._reward_window // 2:
             return True
 
@@ -852,7 +919,7 @@ class DynamicEntCoefCallback(BaseCallback):
         if improved:
             self._best_avg_reward = avg_reward
             self._last_best_timestep = self.num_timesteps
-            new_ent = max(self._base, self._current_ent * self._decay_factor)
+            new_ent = max(self._min, self._current_ent * self._decay_factor)
             if abs(new_ent - self._current_ent) > 1e-6:
                 self._current_ent = new_ent
                 self.model.ent_coef = self._current_ent
@@ -866,6 +933,23 @@ class DynamicEntCoefCallback(BaseCallback):
                 self.model.ent_coef = self._current_ent
                 if self.verbose:
                     print(f"  [DynEnt] {self._no_progress_steps} 步无进展(avg={avg_reward:.1f})，ent_coef ↑ {self._current_ent:.4f}")
+
+        # plateau 检测：每隔 plateau_check_steps 检查一次
+        # 如果 avg_reward 涨幅不足 plateau_min_gain，说明策略卡在某个稳定但次优的状态
+        if (self.num_timesteps - self._plateau_last_check_step) >= self._plateau_check_steps:
+            gain = avg_reward - self._plateau_last_avg
+            self._plateau_last_avg = avg_reward
+            self._plateau_last_check_step = self.num_timesteps
+            if 0 <= gain < self._plateau_min_gain and self._current_ent < self._max:
+                # 平台期：小幅提升熵（boost_step 的一半），比完全停滞时温和
+                plateau_boost = self._boost_step * 0.5
+                new_ent = min(self._max, self._current_ent + plateau_boost)
+                if abs(new_ent - self._current_ent) > 1e-6:
+                    self._current_ent = new_ent
+                    self.model.ent_coef = self._current_ent
+                    if self.verbose:
+                        print(f"  [DynEnt] plateau 检测：{self._plateau_check_steps} 步涨幅仅 {gain:.1f}(<{self._plateau_min_gain})，"
+                              f"ent_coef 小幅↑ {self._current_ent:.4f}")
 
         if self.logger:
             self.logger.record("train/entropy_coef", self._current_ent)
@@ -957,13 +1041,14 @@ def main():
         callbacks.append(DynamicEntCoefCallback(
             base_ent_coef=ENT_COEF_CONTINUE,
             max_ent_coef=DYN_ENT_MAX,
+            min_ent_coef=DYN_ENT_MIN,
             no_progress_steps=DYN_ENT_NO_PROGRESS_STEPS,
             boost_step=DYN_ENT_BOOST_STEP,
             decay_factor=DYN_ENT_DECAY_FACTOR,
             verbose=1,
         ))
-        print("动态熵系数已启用：base={} max={} 无进展{}步触发".format(
-            ENT_COEF_CONTINUE, DYN_ENT_MAX, DYN_ENT_NO_PROGRESS_STEPS))
+        print("动态熵系数已启用：base={} min={} max={} 无进展{}步触发".format(
+            ENT_COEF_CONTINUE, DYN_ENT_MIN, DYN_ENT_MAX, DYN_ENT_NO_PROGRESS_STEPS))
     if EARLY_STOP_ENABLED:
         callbacks.append(EarlyStoppingOnRewardDrop(
             ratio=EARLY_STOP_RATIO,
