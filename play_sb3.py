@@ -20,6 +20,7 @@ finally:
 
 # 复用训练脚本的环境构建与补丁（不执行 main）
 from train_sb3 import make_env, _get_gym_env_for_render, FRAME_STACK
+from sb3_device import SB3_DEVICE
 
 from stable_baselines3 import PPO, DQN
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
@@ -57,9 +58,10 @@ def main():
 
     print("加载模型: {}".format(path_used))
     if ALGORITHM.upper() == "DQN":
-        model = DQN.load(path_used)
+        model = DQN.load(path_used, device=SB3_DEVICE)
     else:
-        model = PPO.load(path_used)
+        model = PPO.load(path_used, device=SB3_DEVICE)
+    print("推理设备: {}（SB3_DEVICE={}）".format(model.device, SB3_DEVICE))
 
     env = DummyVecEnv([partial(make_env, env_id=PLAY_ENV_ID)])
     env = VecFrameStack(env, n_stack=FRAME_STACK)

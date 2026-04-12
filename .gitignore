@@ -8,5 +8,9 @@ __pycache__/
 # IDE
 .idea/
 
+# 本地配置与临时文件
+.claude/
+tmp/
+
 # 虚拟环境
 .venv/
