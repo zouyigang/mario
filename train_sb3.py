@@ -161,7 +161,7 @@ DEATH_PENALTY_SEEN = 100          # v6：与超时统一为 100，消除"求死"
 # 总训练步数
 TOTAL_TIMESTEPS = 30_000_000   # frame_skip 2 下同样物理时间需更多步；原 20M
 # 从头训 PPO 的熵系数与学习率
-ENT_COEF = 0.05            # 从 0.02 → 0.05，迫使在岔口尝试不同跳跃时机
+ENT_COEF = 0.01            # 从 0.02 → 0.05，迫使在岔口尝试不同跳跃时机
 # 动态熵系数（DynamicEntCoefCallback）
 DYN_ENT_ENABLED = True          # True=启用动态熵；False=固定 ENT_COEF
 DYN_ENT_MIN = 0.02             # 熵系数下限
@@ -278,8 +278,9 @@ MAZE_STALL_ESCALATE_PER_STEP = 0.0
 MAZE_STALL_ESCALATE_CAP = 0.0
 FRONTIER_BONUS = 0.1       # v4：从 0.3 → 0.1，避免在边界来回踱步 farm
 # ---- 纵向探索奖励（v4：关闭，关卡先验不通用）----
-Y_LAYER_BONUS = 0.0          # 4-4 专属信号，做通用奖励应当关闭
-Y_LAYER_SIZE = 32            # Y 层划分粒度（像素，仅供 wrapper 内部使用，bonus=0 时无效）
+Y_LAYER_BONUS = 20          # 4-4 专属信号，做通用奖励应当关闭
+Y_LAYER_SIZE = 24            # 平台高差阈值（像素）：起跳前 y 与落地 y 之差 ≥ 该值才算到达新层；同时作为落点去重桶 y 粒度
+Y_LAYER_X_BUCKET = 32        # 落点去重桶 x 粒度（像素）：与 Y_LAYER_SIZE 一起组成二维去重 key，区分同高度但不同位置的平台
 
 # ---- 无新探索：v4 缩短到 2 秒触发持续扣分 ----
 # frame_skip=2，~30 step/s → 2 秒 ≈ 60 步
@@ -299,6 +300,14 @@ MAZE_STEP_PENALTY_SEEN = 0.0
 # ---- 回传检测宽松化（迷宫模式）----
 MAZE_BACKTRACK_GRACE_STEPS = 40    # frame_skip 2→步数×2；原 20
 MAZE_BACKTRACK_SINGLE_STEP_MAX = 400  # 像素值，不需要翻倍
+
+# ---- 战略性后退激励（v7：解决"不往回走"问题）----
+STRATEGIC_BACKTRACK_ENABLED = True       # 是否启用战略性后退奖励
+BACKTRACK_THRESHOLD = 20                  # 触发后退检测的最小X减少量（像素）
+BACKTRACK_NEW_CELL_BONUS = 2.5            # 后退期间发现新格子的额外奖励
+BACKTRACK_SUCCESS_BONUS = 15.0            # 后退后重新超过历史峰值的"绕路成功"奖励
+BACKTRACK_TIMEOUT_STEPS = 120             # 后退超时步数（约4秒），超时无新发现则退出
+BACKTRACK_REVISIT_ZONE_PENALTY = 0.5      # 重复后退同一区间的衰减因子
 
 # ======================
 # 死循环检测：从包装链中取马里奥横向坐标
@@ -426,6 +435,7 @@ class CellExplorationWrapper(Wrapper):
                  frontier_bonus=0.0,
                  y_layer_bonus=0.0,
                  y_layer_size=32,
+                 y_layer_x_bucket=32,
                  episode_cell_bonus_cap=30.0):
         super().__init__(env)
         self._cell_size = int(cell_size)
@@ -436,13 +446,19 @@ class CellExplorationWrapper(Wrapper):
         self._frontier_bonus = float(frontier_bonus)
         self._y_layer_bonus = float(y_layer_bonus)
         self._y_layer_size = int(y_layer_size)
+        self._y_layer_x_bucket = int(y_layer_x_bucket)
         self._episode_cell_bonus_cap = float(episode_cell_bonus_cap)
         self._episode_cell_bonus_total = 0.0
         self._visited = set()
         self._visited_y_layers = set()
+        self._frontier_used = set()
         self._steps_without_new = 0
         self._last_cell = None
         self._same_cell_steps = 0
+        self._prev_y = 0
+        self._in_air = False
+        self._takeoff_y = 0
+        self._stable_streak = 0
 
     def _cell(self, x, y):
         return (int(x) // self._cell_size, int(y) // self._cell_size)
@@ -451,15 +467,20 @@ class CellExplorationWrapper(Wrapper):
         obs, info = self.env.reset(**kwargs)
         self._visited.clear()
         self._visited_y_layers.clear()
+        self._frontier_used.clear()
         self._steps_without_new = 0
         self._episode_cell_bonus_total = 0.0
         x = _get_mario_x_from_env(self.env)
         y = _get_mario_y_from_env(self.env)
         start_cell = self._cell(x, y)
         self._visited.add(start_cell)
-        self._visited_y_layers.add(y // self._y_layer_size)
+        self._visited_y_layers.add((x // self._y_layer_x_bucket, y // self._y_layer_size))
         self._last_cell = start_cell
         self._same_cell_steps = 0
+        self._prev_y = y
+        self._in_air = False
+        self._takeoff_y = y
+        self._stable_streak = 0
         return obs, info
 
     def step(self, action):
@@ -471,18 +492,42 @@ class CellExplorationWrapper(Wrapper):
         cell_changed = prev_cell is not None and cell != prev_cell
         info["cell_changed"] = cell_changed
 
-        # Y 层探索奖励：首次到达新的 Y 层时给额外奖励，引导纵向移动（下跳）
-        y_layer = y // self._y_layer_size
-        if self._y_layer_bonus > 0 and y_layer not in self._visited_y_layers:
-            self._visited_y_layers.add(y_layer)
-            reward += self._y_layer_bonus
+        # 平台层探索奖励：用起跳前 y 与落地 y 的差值判断是否到达新层平台
+        # dy != 0 视为离地/在空中；连续 2 帧 dy == 0 视为落地（避开跳跃顶点单帧静止误判）
+        # 奖励正比于 Δy / 阈值，单次封顶 4×bonus，使一次大跳与等价的多次小跳收益相同，杜绝拆分 farm
+        # 只奖励往下跳（y > takeoff_y），往上跳回原层不给奖励，防止"跳下再跳上"刷分
+        dy = y - self._prev_y
+        platform_reward = 0.0
+        if dy != 0:
+            if not self._in_air:
+                self._in_air = True
+                self._takeoff_y = self._prev_y
+            self._stable_streak = 0
+        else:
+            self._stable_streak += 1
+            if self._in_air and self._stable_streak >= 2:
+                self._in_air = False
+                delta = y - self._takeoff_y  # 正值=往下跳，负值=往上跳
+                if delta >= self._y_layer_size:  # 只有往下跳才给奖励
+                    bucket = (x // self._y_layer_x_bucket, y // self._y_layer_size)
+                    if bucket not in self._visited_y_layers:
+                        self._visited_y_layers.add(bucket)
+                        mult = min(delta / self._y_layer_size, 4.0)
+                        platform_reward = self._y_layer_bonus * mult
+
+        if self._y_layer_bonus > 0 and platform_reward > 0:
+            reward += platform_reward
             info["new_y_layer"] = True
-            info["y_layer_bonus_given"] = self._y_layer_bonus  # 供 ClipReward 层读取，避免被覆盖
+            info["y_layer_bonus_given"] = platform_reward  # 供 ClipReward 层读取，避免被覆盖
         else:
             info["new_y_layer"] = False
             info["y_layer_bonus_given"] = 0.0
+        self._prev_y = y
 
-        if cell not in self._visited:
+        # 仅在「贴地」帧更新格子探索：空中帧（_in_air=True）一律视为非新格
+        # 避免起跳弧线穿过相邻 y 格被算作探索；落地后第 2 帧 _in_air 才转 False，
+        # 1 帧延迟可接受（同 x 格通常在落地后立即被记入）。
+        if (not self._in_air) and cell not in self._visited:
             self._visited.add(cell)
             info["new_cell"] = True
             info["cells_visited"] = len(self._visited)
@@ -534,11 +579,124 @@ class CellExplorationWrapper(Wrapper):
         neighbors = [(cx + dx, cy + dy) for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))]
         near_new = any(n not in self._visited for n in neighbors)
         info["frontier_reward"] = 0.0
-        if self._frontier_bonus > 0 and near_new and not info.get("new_cell", False):
+        # frontier 一次性化：每个边界格至多发一次，杜绝在边界来回踱步的 per-step farm
+        if (self._frontier_bonus > 0
+                and near_new
+                and not info.get("new_cell", False)
+                and cell not in self._frontier_used):
+            self._frontier_used.add(cell)
             reward += self._frontier_bonus
             info["frontier_reward"] = float(self._frontier_bonus)
 
         self._last_cell = cell
+        return obs, reward, terminated, truncated, info
+
+
+class StrategicBacktrackWrapper(Wrapper):
+    """
+    战略性后退激励器：识别并奖励"有目的的往回走"行为。
+
+    核心逻辑：
+    1. 持续跟踪本局最大 X 位置（_peak_x）
+    2. 当检测到从 _peak_x 开始的显著后退（dx <= -threshold）时，进入"后退模式"
+    3. 后退模式期间：
+       - 如果发现新格子（new_cell=True）→ 给予额外奖励（鼓励探索性后退）
+       - 记录后退距离和发现的新格子数
+    4. 当重新前进超过历史峰值时 → 给予"绕路成功"奖励（bonus）
+    5. 防滥用机制：
+       - 同一区间的重复后退会衰减奖励
+       - 后退超时无新发现 → 退出后退模式（避免死循环）
+
+    设计目标：
+    - 解决"智能体只往右走、不往回走探索"的问题
+    - 让 AI 学会：有时需要"先退后进"才能到达目标
+    - 特别适用于有坑/管道需要绕行的迷宫式关卡
+    """
+
+    def __init__(self, env,
+                 backtrack_threshold=80,
+                 backtrack_new_cell_bonus=2.0,
+                 backtrack_success_bonus=10.0,
+                 backtrack_timeout_steps=120,
+                 revisit_zone_penalty_factor=0.5):
+        super().__init__(env)
+        self._threshold = int(backtrack_threshold)
+        self._new_cell_bonus = float(backtrack_new_cell_bonus)
+        self._success_bonus = float(backtrack_success_bonus)
+        self._timeout = int(backtrack_timeout_steps)
+        self._revisit_factor = float(revisit_zone_penalty_factor)
+
+        self._peak_x = 0
+        self._prev_x = 0
+        self._in_backtrack = False
+        self._backtrack_start_x = 0
+        self._backtrack_steps = 0
+        self._backtrack_new_cells = 0
+        self._visited_backtrack_zones = set()
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        x = _get_mario_x_from_env(self.env)
+        self._peak_x = x
+        self._prev_x = x
+        self._in_backtrack = False
+        self._backtrack_start_x = x
+        self._backtrack_steps = 0
+        self._backtrack_new_cells = 0
+        self._visited_backtrack_zones.clear()
+        info["strategic_backtrack"] = False
+        info["backtrack_success"] = False
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        current_x = _get_mario_x_from_env(self.env)
+        dx = current_x - self._prev_x
+
+        info["strategic_backtrack"] = False
+        info["backtrack_success"] = False
+        info["backtrack_active"] = self._in_backtrack
+
+        if current_x > self._peak_x:
+            old_peak = self._peak_x
+            self._peak_x = current_x
+
+            if self._in_backtrack:
+                self._in_backtrack = False
+                if self._backtrack_new_cells > 0:
+                    reward += self._success_bonus
+                    info["backtrack_success"] = True
+                    info["backtrack_new_cells_found"] = self._backtrack_new_cells
+                    info["backtrack_distance"] = old_peak - self._backtrack_start_x
+                self._backtrack_steps = 0
+                self._backtrack_new_cells = 0
+
+        elif (not self._in_backtrack
+              and current_x <= self._peak_x - self._threshold
+              and self._peak_x > 100):
+            zone_key = (self._peak_x // 100, current_x // 100)
+            if zone_key not in self._visited_backtrack_zones:
+                self._in_backtrack = True
+                self._backtrack_start_x = current_x
+                self._backtrack_steps = 0
+                self._backtrack_new_cells = 0
+                info["strategic_backtrack"] = True
+
+        if self._in_backtrack:
+            self._backtrack_steps += 1
+            if info.get("new_cell", False):
+                self._backtrack_new_cells += 1
+                reward += self._new_cell_bonus
+                info["backtrack_new_cell_bonus"] = self._new_cell_bonus
+
+            if self._backtrack_steps >= self._timeout:
+                zone_key = (self._peak_x // 100, self._backtrack_start_x // 100)
+                self._visited_backtrack_zones.add(zone_key)
+                self._in_backtrack = False
+                self._backtrack_steps = 0
+                self._backtrack_new_cells = 0
+
+        self._prev_x = current_x
         return obs, reward, terminated, truncated, info
 
 
@@ -631,29 +789,28 @@ class ClipRewardExceptDeathWrapper(Wrapper):
         # 优先级 6：正常步
         elif self._maze_mode:
             frontier_add = float(info.get("frontier_reward", 0.0) or 0.0)
-            # 上游 CellExplorationWrapper 叠加的额外奖励（Y层奖励等），需要保留
             extra_bonus = float(info.get("y_layer_bonus_given", 0.0))
+            backtrack_active = info.get("backtrack_active", False)
+            backtrack_new_cell_bonus = float(info.get("backtrack_new_cell_bonus", 0.0) or 0.0)
+
             if info.get("new_cell", False):
-                # v4：使用 CellExplorationWrapper 计算好的 sqrt 衰减 + 硬封顶 cell bonus
-                # （此值由上游 wrapper 写入 info["cell_bonus_step"]，本层不能再用固定常量覆盖）
                 cell_bonus = float(info.get("cell_bonus_step", 0.0))
-                # 修复方向偏见：环境 reward ≥ 0 时衰减保留，否则用固定奖励
                 if reward >= 0:
-                    # 往右走、得到正向位移：衰减环境奖励 + cell 探索奖励
                     reward = reward * self._env_reward_scale + cell_bonus
                 else:
-                    # 往左走、得到负向位移：用固定奖励代替（避免方向偏见）
-                    reward = cell_bonus
-                reward += extra_bonus  # 加上 Y_LAYER_BONUS
+                    if backtrack_active:
+                        reward = cell_bonus + backtrack_new_cell_bonus + 1.0
+                    else:
+                        reward = cell_bonus
             elif info.get("cell_changed", False):
-                # 移动到已访问格子时，也考虑方向：往右走（正向）应该比往左走更有利
                 base_revisit = float(info.get("maze_revisit_reward", 0.0))
                 if reward >= 0:
-                    # 往右/往下：小正值而非负值（鼓励快速前进，即使是老路）
                     reward = max(base_revisit, 0.0) + frontier_add
                 else:
-                    # 往左/往上：保持负值（避免无限往回走）
-                    reward = base_revisit + frontier_add
+                    if backtrack_active:
+                        reward = max(base_revisit, 0.5) + frontier_add + backtrack_new_cell_bonus
+                    else:
+                        reward = base_revisit + frontier_add
             else:
                 same_steps = int(info.get("same_cell_steps", 0))
                 escalated = min(
@@ -664,6 +821,7 @@ class ClipRewardExceptDeathWrapper(Wrapper):
                     reward = -escalated + frontier_add
                 else:
                     reward = frontier_add
+            reward += extra_bonus  # 加上 Y_LAYER_BONUS
             # 无新探索"持续扣分"——阶梯升级（v4：2 秒后开始，每多一步扣分递增）
             if info.get("no_new_cell", False) and self._maze_no_progress_penalty > 0:
                 steps_over = max(
@@ -790,8 +948,19 @@ def make_env(env_id=None):
             frontier_bonus=FRONTIER_BONUS,
             y_layer_bonus=Y_LAYER_BONUS,
             y_layer_size=Y_LAYER_SIZE,
+            y_layer_x_bucket=Y_LAYER_X_BUCKET,
             episode_cell_bonus_cap=CELL_BONUS_EPISODE_CAP,
         )
+
+        if STRATEGIC_BACKTRACK_ENABLED:
+            env = StrategicBacktrackWrapper(
+                env,
+                backtrack_threshold=BACKTRACK_THRESHOLD,
+                backtrack_new_cell_bonus=BACKTRACK_NEW_CELL_BONUS,
+                backtrack_success_bonus=BACKTRACK_SUCCESS_BONUS,
+                backtrack_timeout_steps=BACKTRACK_TIMEOUT_STEPS,
+                revisit_zone_penalty_factor=BACKTRACK_REVISIT_ZONE_PENALTY,
+            )
 
         if ENABLE_TELEPORT_DETECTION:
             env = TeleportBackDetector(
