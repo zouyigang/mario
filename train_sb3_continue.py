@@ -167,15 +167,15 @@ LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
 # v4：旧 best 在新 reward 下变成大负分，被污染的 value function 重学需要时间
 ADDITIONAL_TIMESTEPS = 8_000_000
 # 加载后覆盖到模型上的熵系数与学习率（v4：临时拉高熵迫使打破"错路farm"局部最优）
-ENT_COEF_CONTINUE = 0.05   # v4：0.05 → 0.10，强制重新探索
+ENT_COEF_CONTINUE = 0.03   # v8.9：0.05→0.03（=DYN_ENT_MIN），从下限启动，先信任 best 策略，停滞由动态机制升熵
 # 动态熵系数（DynamicEntCoefCallback）
 DYN_ENT_ENABLED = True
-DYN_ENT_MIN = 0.02             # 熵系数下限
-DYN_ENT_MAX = 0.10              # 熵系数上限
+DYN_ENT_MIN = 0.03             # v8.9：0.02→0.03，收紧动态范围下限
+DYN_ENT_MAX = 0.06              # v8.9：0.10→0.06，收紧动态范围上限（2x 比值，减小震荡）
 DYN_ENT_EVAL_INTERVAL = 100_000  # 每隔多少步评估一次改进速率
 DYN_ENT_FAST_THRESHOLD = 30.0  # 改进速率高于此值 → 降熵
 DYN_ENT_SLOW_THRESHOLD = 5.0   # 改进速率低于此值 → 升熵
-DYN_ENT_ADJUST_SPEED = 0.15    # EMA 平滑系数
+DYN_ENT_ADJUST_SPEED = 0.10    # v8.9：0.15→0.10，EMA 更平滑
 LR_CONTINUE = 3e-4              # 从 1e-4 → 3e-4，比初训还高，打破僵局
 LR_CONTINUE_END = 5e-5          # 从 3e-5 → 5e-5，末期仍有更新能力
 USE_LR_DECAY_CONTINUE = True   # True=学习率从 LR_CONTINUE 线性降到 LR_CONTINUE_END
@@ -241,7 +241,7 @@ TELEPORT_IMMEDIATE_PENALTY = 50
 TELEPORT_BRANCH_BASE_PENALTY = 50
 WRONG_BRANCH_STEP_CLAWBACK = 0.0
 MAX_CLAWBACK = 0.0
-CORRECT_WRAP_BONUS = 15.0
+CORRECT_WRAP_BONUS = 0.0            # v8：暂关——correct_wrap_new_area 当前在检测器里恒 False，留下来是摆设
 # 回传 Replay 录制（用于人工回看判断检测是否准确）
 SAVE_TELEPORT_REPLAYS = False                                   # 是否保存回传 episode 的原始画面
 TELEPORT_REPLAY_DIR = "./sb3_mario_logs/teleport_replays"       # replay 保存目录
@@ -259,16 +259,16 @@ MAZE_MODE = True           # True = 迷宫模式；False = 原直线模式，行
 CELL_SIZE = 16             # 格子大小（像素）
 CELL_VISIT_BONUS = 3.5     # v6：2.5 → 3.5，加强前期探索信号
 CELL_BONUS_EPISODE_CAP = 1e9  # 本局所有 cell bonus 累计上限（设为极大值，实际无上限，以便区分探索多少）
-ENV_REWARD_SCALE = 0.4     # 往右时环境原始奖励的权重（避免向右激励过强）
+ENV_REWARD_SCALE = 0.1     # v8：0.4→0.1，迷宫关需绕路时不能让"向右天然爽"主导策略
 CELL_REVISIT_REWARD = 0.0  # 重复进入同一格 → 无奖无罚（按方案要求）
 MAZE_STALL_PENALTY = 0.0   # 关闭"同格停留"扣分；统一由"无新探索"持续扣分接管
 MAZE_STALL_ESCALATE_PER_STEP = 0.0
 MAZE_STALL_ESCALATE_CAP = 0.0
 FRONTIER_BONUS = 0.1       # v4：从 0.3 → 0.1，避免在边界来回踱步 farm
 # ---- 纵向探索奖励（v4：关闭，关卡先验不通用）----
-Y_LAYER_BONUS = 20          # 4-4 专属信号，做通用奖励应当关闭
+Y_LAYER_BONUS = 5           # v8：20→5，避免"到新层"信号盖过"在新层先往哪走"
 Y_LAYER_SIZE = 24            # 平台高差阈值（像素）：起跳前 y 与落地 y 之差 ≥ 该值才算到达新层；同时作为落点去重桶 y 粒度
-Y_LAYER_X_BUCKET = 32        # 落点去重桶 x 粒度（像素）：与 Y_LAYER_SIZE 一起组成二维去重 key，区分同高度但不同位置的平台
+Y_LAYER_X_BUCKET = 256       # v8.6：32→256（一屏宽），防止同一物理平台横跨多个 x bucket 被反复奖励的漏洞
 
 # ---- 无新探索：v4 缩短到 2 秒触发持续扣分 ----
 # frame_skip=2，~30 step/s → 2 秒 ≈ 60 步
@@ -290,11 +290,26 @@ MAZE_BACKTRACK_SINGLE_STEP_MAX = 400  # 像素值，不需要翻倍
 
 # ---- 战略性后退激励（v7：解决"不往回走"问题）----
 STRATEGIC_BACKTRACK_ENABLED = True       # 是否启用战略性后退奖励
-BACKTRACK_THRESHOLD = 20                  # 触发后退检测的最小X减少量（像素）
-BACKTRACK_NEW_CELL_BONUS = 2.5            # 后退期间发现新格子的额外奖励
-BACKTRACK_SUCCESS_BONUS = 15.0            # 后退后重新超过历史峰值的"绕路成功"奖励
+BACKTRACK_THRESHOLD = 8                   # v8：20→8，分叉口最初几步就接管
+BACKTRACK_NEW_CELL_BONUS = 1.0            # v8：2.5→1.0，弱化过程奖励，重心放到 success
+BACKTRACK_SUCCESS_BONUS = 0.0             # v8.5：50→0，"突破 peak_x" 在新层场景下是反向激励（鼓励右走回峰值），左探激励改由 PostLayerLeftBonusWrapper 独立覆盖
 BACKTRACK_TIMEOUT_STEPS = 120             # 后退超时步数（约4秒），超时无新发现则退出
 BACKTRACK_REVISIT_ZONE_PENALTY = 0.5      # 重复后退同一区间的衰减因子
+
+# ---- 新层短窗口左移奖励（v8.2：阶梯里程碑 + 左侧新层大奖 + 死亡折扣）----
+POST_LAYER_LEFT_BONUS_ENABLED = True
+POST_LAYER_LEFT_PER_PIXEL = 0.1           # 每像素新增左移的奖励
+POST_LAYER_LEFT_WINDOW = 60               # 窗口步数（≈2秒）；越过入口x或超时即关闭
+POST_LAYER_MILESTONES = ((15, 1.5), (30, 3.0), (60, 8.0))
+POST_LAYER_COMMIT_DEPTH = 0               # v8.4：1→0，落新层后只要还在 zone 内（未回右侧）就打折
+POST_LAYER_NEW_LAYER_LEFT_BONUS = 0.0     # v8.7：20→0，去掉链式跳层放大器，避免 drop-left-drop-die 的正反馈薅羊毛
+DEATH_PENALTY_POST_LAYER_FACTOR = 0.4     # v8.7：0.2→0.4，committed 死亡 -40，单层跳+左探+死变净负，但仍轻于全额防止风险厌恶
+
+# v8.8：前沿死亡折扣——让"右路前沿试探"死亡享受与左探同等折扣，消除方向不对称
+FRONTIER_DEATH_DISCOUNT_ENABLED = True
+FRONTIER_DEATH_TOLERANCE = 8              # 当前 x 与 max_x 差距 ≤ 该值视为"在前沿"
+FRONTIER_DEATH_WINDOW = 60                # 距上次 max_x 增长 ≤ 该步数视为"仍在推进"
+# 折扣乘子复用 DEATH_PENALTY_POST_LAYER_FACTOR
 
 # ======================
 # 死循环检测：从包装链中取马里奥横向坐标
@@ -641,6 +656,10 @@ class StrategicBacktrackWrapper(Wrapper):
         info["strategic_backtrack"] = False
         info["backtrack_success"] = False
         info["backtrack_active"] = self._in_backtrack
+        # v8：bonus 通过 info 传递，由 ClipRewardExceptDeathWrapper 统一在最后无条件加上
+        # 直接 reward+= 会被 ClipReward 在 maze 正常步分支重写为 cell_bonus/frontier 等而丢失
+        info["backtrack_success_bonus"] = 0.0
+        info["backtrack_new_cell_bonus"] = 0.0
 
         if current_x > self._peak_x:
             old_peak = self._peak_x
@@ -649,8 +668,8 @@ class StrategicBacktrackWrapper(Wrapper):
             if self._in_backtrack:
                 self._in_backtrack = False
                 if self._backtrack_new_cells > 0:
-                    reward += self._success_bonus
                     info["backtrack_success"] = True
+                    info["backtrack_success_bonus"] = self._success_bonus
                     info["backtrack_new_cells_found"] = self._backtrack_new_cells
                     info["backtrack_distance"] = old_peak - self._backtrack_start_x
                 self._backtrack_steps = 0
@@ -671,7 +690,6 @@ class StrategicBacktrackWrapper(Wrapper):
             self._backtrack_steps += 1
             if info.get("new_cell", False):
                 self._backtrack_new_cells += 1
-                reward += self._new_cell_bonus
                 info["backtrack_new_cell_bonus"] = self._new_cell_bonus
 
             if self._backtrack_steps >= self._timeout:
@@ -682,6 +700,157 @@ class StrategicBacktrackWrapper(Wrapper):
                 self._backtrack_new_cells = 0
 
         self._prev_x = current_x
+        return obs, reward, terminated, truncated, info
+
+
+class PostLayerLeftBonusWrapper(Wrapper):
+    """
+    新层短窗口左移奖励（v8.2）：阶梯里程碑 + 左侧新层大奖 + 死亡折扣信号。
+
+    设计目标：解决"Mario 怕跳坑死，宁可不左探"的死亡尾风险问题。
+      a) 阶梯发奖：尝试到 15/30/60px 各发一档，死在路上至少能吃到前几档；
+      b) 左侧新层大奖：活动窗口内若再触发 new_y_layer 且 x<entry_x → +bonus（真往左下找到下一层）；
+      c) committed 标记：累计左移 ≥ commit_depth 时置位，episode 内持久；
+         由 ClipReward 读取，作为"死亡惩罚减半"的依据。
+    """
+
+    def __init__(self, env,
+                 per_pixel=0.1,
+                 window_steps=60,
+                 milestones=((15, 1.5), (30, 3.0), (60, 8.0)),
+                 commit_depth=15,
+                 new_layer_left_bonus=20.0):
+        super().__init__(env)
+        self._per_pixel = float(per_pixel)
+        self._window = int(window_steps)
+        self._milestones = sorted([(int(d), float(b)) for d, b in milestones])
+        self._commit_depth = int(commit_depth)
+        self._new_layer_left_bonus = float(new_layer_left_bonus)
+        self._active = False
+        self._entry_x = 0
+        self._min_x = 0
+        self._steps_left = 0
+        self._milestones_paid = 0
+        # v8.3：committed 改为"几何 zone"语义——只要 _zone_active 且当前 x 距 zone_entry_x 的左移 >= commit_depth
+        # 不再用 episode 内持久标志（避免不相关死亡借光）
+        self._zone_entry_x = 0
+        self._zone_active = False
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._active = False
+        self._entry_x = 0
+        self._min_x = 0
+        self._steps_left = 0
+        self._milestones_paid = 0
+        self._zone_entry_x = 0
+        self._zone_active = False
+        info["post_layer_left_bonus"] = 0.0
+        info["post_layer_committed"] = False
+        return obs, info
+
+    def _open_window(self, x):
+        self._active = True
+        self._entry_x = x
+        self._min_x = x
+        self._steps_left = self._window
+        self._milestones_paid = 0
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        current_x = _get_mario_x_from_env(self.env)
+        bonus = 0.0
+
+        new_y_layer = info.get("new_y_layer", False)
+
+        # ---- 几何 zone（独立于 bonus 窗口，无 60 步超时） ----
+        # 进入：每次 new_y_layer 都把 zone_entry_x 锚到当前 x（更深层会自动跟进）
+        # 离开：current_x > zone_entry_x（已重新越过起点右侧）
+        if new_y_layer:
+            self._zone_entry_x = current_x
+            self._zone_active = True
+        elif self._zone_active and current_x > self._zone_entry_x:
+            self._zone_active = False
+
+        # ---- bonus 窗口（仍受 60 步限制） ----
+        if new_y_layer:
+            if not self._active:
+                self._open_window(current_x)
+            elif current_x < self._entry_x:
+                bonus += self._new_layer_left_bonus
+                self._open_window(current_x)
+
+        if self._active:
+            if current_x > self._entry_x:
+                self._active = False
+                self._steps_left = 0
+            else:
+                self._steps_left -= 1
+                if current_x < self._min_x:
+                    delta_left = self._min_x - current_x
+                    bonus += self._per_pixel * delta_left
+                    self._min_x = current_x
+                    depth = self._entry_x - self._min_x
+                    while (self._milestones_paid < len(self._milestones)
+                            and depth >= self._milestones[self._milestones_paid][0]):
+                        bonus += self._milestones[self._milestones_paid][1]
+                        self._milestones_paid += 1
+                if self._steps_left <= 0:
+                    self._active = False
+
+        # committed = 当前在 zone 内 且 距 entry 的左移 >= commit_depth
+        # commit_depth=0 时：站在新层入口处也算 committed（即"刚跳到新层、未回右侧"全程打折）
+        post_committed = (self._zone_active
+                          and (self._zone_entry_x - current_x) >= self._commit_depth)
+
+        info["post_layer_left_bonus"] = bonus
+        info["post_layer_left_active"] = self._active
+        info["post_layer_left_depth"] = self._entry_x - self._min_x if self._active else 0
+        info["post_layer_committed"] = post_committed
+        info["post_layer_zone_active"] = self._zone_active
+        return obs, reward, terminated, truncated, info
+
+
+class FrontierProgressWrapper(Wrapper):
+    """v8.8：前沿推进追踪器——判断 Mario 是否正在'试探未知边界'。
+    用于让前沿死亡享受与左探相同的折扣，消除"右路死亡贵 / 左路死亡便宜"的不对称。
+
+    frontier_committed = True 仅当：
+      1) 当前 x 距本局 max_x ≤ tolerance（确实在最远处，没退）
+      2) 距 max_x 上次增长 ≤ window 步（最近还在推进，没在原地凑死）
+      3) max_x > 50（关卡起点附近不算）
+    """
+
+    def __init__(self, env, tolerance=8, window=60):
+        super().__init__(env)
+        self._tol = int(tolerance)
+        self._window = int(window)
+        self._max_x = 0
+        self._steps_since_grew = 0
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._max_x = _get_mario_x_from_env(self.env)
+        self._steps_since_grew = 0
+        info["frontier_committed"] = False
+        info["frontier_max_x"] = int(self._max_x)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        x = _get_mario_x_from_env(self.env)
+        if x > self._max_x:
+            self._max_x = x
+            self._steps_since_grew = 0
+        else:
+            self._steps_since_grew += 1
+        committed = (
+            (self._max_x - x) <= self._tol
+            and self._steps_since_grew <= self._window
+            and self._max_x > 50
+        )
+        info["frontier_committed"] = bool(committed)
+        info["frontier_max_x"] = int(self._max_x)
         return obs, reward, terminated, truncated, info
 
 
@@ -707,10 +876,12 @@ class ClipRewardExceptDeathWrapper(Wrapper):
                  maze_stall_penalty=0.0,
                  maze_stall_escalate_per_step=0.0,
                  maze_stall_escalate_cap=0.0,
-                 maze_step_penalty=0.0):
+                 maze_step_penalty=0.0,
+                 death_penalty_post_layer_factor=1.0):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
         self._death_penalty = float(death_penalty_seen)
+        self._death_penalty_post_layer_factor = float(death_penalty_post_layer_factor)
         self._dead_loop_penalty = float(dead_loop_penalty_seen)
         self._no_progress_penalty = float(no_progress_penalty_seen)
         self._step_penalty = float(step_penalty_seen)
@@ -766,36 +937,41 @@ class ClipRewardExceptDeathWrapper(Wrapper):
             info["death_clawback"] = 0.0
 
         # 优先级 5：死亡（固定惩罚，不 clawback —— 保证多探索 > 少探索）
+        # v8.2：本局曾 committed 到左探尝试 → 死亡惩罚按 factor 折扣，降低"怕跳坑"风险厌恶
+        # v8.8：折扣条件扩展为"任意一种探索推进"——左探 OR 右路前沿（消除方向不对称）
         elif (reward <= self._death_threshold
               or (terminated and not is_flag)):
-            reward = -self._death_penalty
+            penalty = self._death_penalty
+            if (info.get("post_layer_committed", False)
+                    or info.get("frontier_committed", False)):
+                penalty *= self._death_penalty_post_layer_factor
+            reward = -penalty
             info["death_clawback"] = 0.0
+            info["death_penalty_applied"] = penalty
 
         # 优先级 5：正常步
         elif self._maze_mode:
             frontier_add = float(info.get("frontier_reward", 0.0) or 0.0)
             extra_bonus = float(info.get("y_layer_bonus_given", 0.0))
             backtrack_active = info.get("backtrack_active", False)
+            # v8：bonus 统一通过 info 传入，下面三类在分支判定后无条件累加
             backtrack_new_cell_bonus = float(info.get("backtrack_new_cell_bonus", 0.0) or 0.0)
+            backtrack_success_bonus = float(info.get("backtrack_success_bonus", 0.0) or 0.0)
+            post_layer_left_bonus = float(info.get("post_layer_left_bonus", 0.0) or 0.0)
 
             if info.get("new_cell", False):
                 cell_bonus = float(info.get("cell_bonus_step", 0.0))
                 if reward >= 0:
                     reward = reward * self._env_reward_scale + cell_bonus
                 else:
-                    if backtrack_active:
-                        reward = cell_bonus + backtrack_new_cell_bonus + 1.0
-                    else:
-                        reward = cell_bonus
+                    reward = cell_bonus + (1.0 if backtrack_active else 0.0)
             elif info.get("cell_changed", False):
                 base_revisit = float(info.get("maze_revisit_reward", 0.0))
                 if reward >= 0:
                     reward = max(base_revisit, 0.0) + frontier_add
                 else:
-                    if backtrack_active:
-                        reward = max(base_revisit, 0.5) + frontier_add + backtrack_new_cell_bonus
-                    else:
-                        reward = base_revisit + frontier_add
+                    floor = 0.5 if backtrack_active else 0.0
+                    reward = max(base_revisit, floor) + frontier_add
             else:
                 same_steps = int(info.get("same_cell_steps", 0))
                 escalated = min(
@@ -806,7 +982,8 @@ class ClipRewardExceptDeathWrapper(Wrapper):
                     reward = -escalated + frontier_add
                 else:
                     reward = frontier_add
-            reward += extra_bonus  # 加上 Y_LAYER_BONUS
+            # 三类 bonus 统一在最后加，避免被上面 reward= 重写时丢失
+            reward += extra_bonus + backtrack_new_cell_bonus + backtrack_success_bonus + post_layer_left_bonus
             # 无新探索"持续扣分"——阶梯升级（v4：2 秒后开始，每多一步扣分递增）
             if info.get("no_new_cell", False) and self._maze_no_progress_penalty > 0:
                 steps_over = max(
@@ -942,6 +1119,23 @@ def make_env(env_id=None):
                 revisit_zone_penalty_factor=BACKTRACK_REVISIT_ZONE_PENALTY,
             )
 
+        if POST_LAYER_LEFT_BONUS_ENABLED:
+            env = PostLayerLeftBonusWrapper(
+                env,
+                per_pixel=POST_LAYER_LEFT_PER_PIXEL,
+                window_steps=POST_LAYER_LEFT_WINDOW,
+                milestones=POST_LAYER_MILESTONES,
+                commit_depth=POST_LAYER_COMMIT_DEPTH,
+                new_layer_left_bonus=POST_LAYER_NEW_LAYER_LEFT_BONUS,
+            )
+
+        if FRONTIER_DEATH_DISCOUNT_ENABLED:
+            env = FrontierProgressWrapper(
+                env,
+                tolerance=FRONTIER_DEATH_TOLERANCE,
+                window=FRONTIER_DEATH_WINDOW,
+            )
+
         if ENABLE_TELEPORT_DETECTION:
             env = TeleportBackDetector(
                 env,
@@ -980,6 +1174,7 @@ def make_env(env_id=None):
                 maze_stall_escalate_per_step=MAZE_STALL_ESCALATE_PER_STEP,
                 maze_stall_escalate_cap=MAZE_STALL_ESCALATE_CAP,
                 maze_step_penalty=MAZE_STEP_PENALTY_SEEN,
+                death_penalty_post_layer_factor=DEATH_PENALTY_POST_LAYER_FACTOR,
             )
     else:
         if DEAD_LOOP_STEPS > 0 or (NO_PROGRESS_PENALTY_AFTER > 0 and NO_PROGRESS_MIN_DX_IN_WINDOW > 0):
