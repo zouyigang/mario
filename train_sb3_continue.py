@@ -167,25 +167,25 @@ LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
 # v4：旧 best 在新 reward 下变成大负分，被污染的 value function 重学需要时间
 ADDITIONAL_TIMESTEPS = 8_000_000
 # 加载后覆盖到模型上的熵系数与学习率（v4：临时拉高熵迫使打破"错路farm"局部最优）
-ENT_COEF_CONTINUE = 0.03   # v8.9：0.05→0.03（=DYN_ENT_MIN），从下限启动，先信任 best 策略，停滞由动态机制升熵
+ENT_COEF_CONTINUE = 0.015  # v9.0：0.03→0.015（=新 DYN_ENT_MIN），巩固模式从更低起步，充分利用 best 已学策略
 # 动态熵系数（DynamicEntCoefCallback）
 DYN_ENT_ENABLED = True
-DYN_ENT_MIN = 0.03             # v8.9：0.02→0.03，收紧动态范围下限
-DYN_ENT_MAX = 0.06              # v8.9：0.10→0.06，收紧动态范围上限（2x 比值，减小震荡）
-DYN_ENT_EVAL_INTERVAL = 100_000  # 每隔多少步评估一次改进速率
-DYN_ENT_FAST_THRESHOLD = 30.0  # 改进速率高于此值 → 降熵
-DYN_ENT_SLOW_THRESHOLD = 5.0   # 改进速率低于此值 → 升熵
-DYN_ENT_ADJUST_SPEED = 0.10    # v8.9：0.15→0.10，EMA 更平滑
-LR_CONTINUE = 3e-4              # 从 1e-4 → 3e-4，比初训还高，打破僵局
-LR_CONTINUE_END = 5e-5          # 从 3e-5 → 5e-5，末期仍有更新能力
+DYN_ENT_MIN = 0.015            # v9.0：0.03→0.015，允许真正"低探索"模式（已会通关时不再强制乱试）
+DYN_ENT_MAX = 0.04             # v9.0：0.06→0.04，停滞时也不 panic 拉高熵
+DYN_ENT_EVAL_INTERVAL = 200_000  # v9.0：100k→200k，看更长窗口，避免被短期波动误判
+DYN_ENT_FAST_THRESHOLD = 15.0  # v9.0：30→15，降熵门槛降低，更容易进入"巩固降熵"模式
+DYN_ENT_SLOW_THRESHOLD = 2.0   # v9.0：5→2，仅在 reward 真死才升熵；否则信任当前策略
+DYN_ENT_ADJUST_SPEED = 0.05    # v9.0：0.10→0.05，EMA 更平滑，几乎不会出现一窗口大跳
+LR_CONTINUE = 1e-4              # v9.0：3e-4→1e-4，3x 降；过大 LR 让策略在"会通关"和"乱探索"间摆动
+LR_CONTINUE_END = 1e-5          # v9.0：5e-5→1e-5，末期更小更新，固化策略
 USE_LR_DECAY_CONTINUE = True   # True=学习率从 LR_CONTINUE 线性降到 LR_CONTINUE_END
 LR_CONTINUE_DECAY_END_FRACTION = 1.0  # 学习率在继续训练进度的多少比例内衰减到末值；必须 > 0
 ALGORITHM = "PPO"   # 须与 checkpoint 保存时的算法一致（"PPO" 或 "DQN"）
 # 继续训时也沿用与从头训一致的 PPO 超参，利于收敛、少抖（加载后覆盖到模型上）
 PPO_N_STEPS = 1024              # frame_skip 2 下步数翻倍，需更长 rollout 覆盖到分支点
 PPO_BATCH_SIZE = 1024
-PPO_N_EPOCHS = 4                # 从 3 → 4，每批数据多学几轮
-PPO_CLIP_RANGE = 0.25           # 从 0.18 → 0.25，允许更大的策略更新幅度
+PPO_N_EPOCHS = 3                # v9.0：4→3，每批数据少学一轮，减小过拟合最近 rollout
+PPO_CLIP_RANGE = 0.15           # v9.0：0.25→0.15，收紧策略更新幅度，单步漂移变小
 # 早停：当 rollout 平均奖励相对「历史最高」明显下降时提前结束，保留峰值附近的策略
 EARLY_STOP_ENABLED = False   # 保守版默认开启，防止接着训太久导致分数崩盘
 EARLY_STOP_RATIO = 0.90     # 保守：0.90 稍宽松，避免轻微波动就停
@@ -212,9 +212,9 @@ DEAD_LOOP_PENALTY = 0    # 改为 0，惩罚统一在 ClipReward 层处理，避
 # ======================
 # 通关奖励（基础 + 时间加权），与 train_sb3 保持一致
 # ======================
-FLAG_BASE_BONUS = 200
+FLAG_BASE_BONUS = 80             # v9.1：150→80，通关奖占比仍近半(~49%)，进一步降方差，让通关是"锦上添花"而非决定胜负
 FLAG_TIME_REF_STEPS = 4500
-FLAG_TIME_PER_STEP = 0.05
+FLAG_TIME_PER_STEP = 0.015       # v9.1：0.025→0.015，配合 BASE→80，预计 flag_total ≈ 80+0.015×630 ≈ 170，占比降到 ~30%
 FLAG_GET_BONUS = FLAG_BASE_BONUS  # 兼容旧引用
 # 迷宫探路时横向位移常小：过重会逼智能体送死重开；宜轻罚或仅作防刷分信号
 NO_PROGRESS_PENALTY_AFTER = 96   # frame_skip 2→步数×2；原 48
@@ -1446,10 +1446,24 @@ def main():
             model.ent_coef = ENT_COEF_CONTINUE
         if getattr(model, "learning_rate", None) is not None:
             lr_decay_fraction = max(float(LR_CONTINUE_DECAY_END_FRACTION), 1e-8)
-            model.learning_rate = (
+            new_lr = (
                 get_linear_fn(LR_CONTINUE, LR_CONTINUE_END, end_fraction=lr_decay_fraction)
                 if USE_LR_DECAY_CONTINUE else LR_CONTINUE
             )
+            # PPO.load() 会同时恢复 learning_rate 和 lr_schedule。
+            # SB3 _update_learning_rate() 用的是 lr_schedule，不是 learning_rate。
+            # 所以必须 _setup_lr_schedule() 重建 schedule，否则覆盖无效，仍走旧 LR。
+            model.learning_rate = new_lr
+            model._setup_lr_schedule()
+            # optimizer 的 param_groups[0]["lr"] 是从 checkpoint 恢复的旧值，
+            # 直到第一次 train() 才被 _update_learning_rate 覆盖；
+            # 这里立即同步，避免日志/TensorBoard 在头几步仍显示旧 LR。
+            initial_lr = float(model.lr_schedule(1.0))
+            for pg in model.policy.optimizer.param_groups:
+                pg["lr"] = initial_lr
+            print("✓ 学习率已重置: {:.2e} → {:.2e}（衰减末值 {:.2e}）".format(
+                initial_lr, LR_CONTINUE_END if USE_LR_DECAY_CONTINUE else initial_lr,
+                LR_CONTINUE_END))
         # 与从头训一致的 PPO 超参，继续训时也改用稳收敛配置
         model.n_steps = PPO_N_STEPS
         model.batch_size = PPO_BATCH_SIZE
