@@ -8,5 +8,9 @@ __pycache__/
 # IDE
 .idea/
 
+# 本地/临时目录
+.claude/
+tmp/
+
 # 虚拟环境
 .venv/
