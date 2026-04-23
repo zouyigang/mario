@@ -125,7 +125,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数（极简经典配置）
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-5-3-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
+MARIO_ENV_ID = "SuperMarioBros-2-2-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT       # 7 个动作：含 NOOP/左/右/跳/跑跳，等待和后退都需要
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
@@ -152,7 +152,7 @@ SPEED_BONUS_PER_STEP = 1.5
 
 # PPO 超参
 ENT_COEF = 0.01
-ENT_COEF_MAX = 0.2  # 自适应熵上限；可改为 0.25～0.3 进一步探索，再高易抖动
+ENT_COEF_MAX = 0.05  # 自适应熵上限；7 动作空间 0.2 会把 logits 抹平导致策略崩塌
 LR = 2.5e-4
 LR_END = 1e-5
 USE_LR_DECAY = True
@@ -352,10 +352,12 @@ class AdaptiveEntropyCallback(BaseCallback):
     若按 n_calls%5000 检查，要等约 5000*10*NUM_ENVS 环境步才会第一次抬熵，极易误以为“回调坏了”。
     """
 
-    def __init__(self, base_ent_coef=0.01, max_ent_coef=0.2,
-                 check_interval_timesteps=20000, patience=6, boost_factor=1.5,
-                 decay_factor=0.9, min_improvement=2.0,
+    def __init__(self, base_ent_coef=0.01, max_ent_coef=0.05,
+                 check_interval_timesteps=20000, patience=12, boost_factor=1.2,
+                 decay_factor=0.85, min_improvement=10.0,
                  flag_rate_window=100, flag_rate_threshold=0.3,
+                 collapse_ratio=0.7, collapse_min_peak=50.0,
+                 peak_forget_factor=0.999,
                  verbose=1):
         super().__init__(verbose)
         self._base = base_ent_coef
@@ -370,6 +372,9 @@ class AdaptiveEntropyCallback(BaseCallback):
         self._last_check_ts = 0
         self._flag_history = deque(maxlen=flag_rate_window)
         self._flag_rate_threshold = flag_rate_threshold
+        self._collapse_ratio = collapse_ratio
+        self._collapse_min_peak = collapse_min_peak
+        self._peak_forget = peak_forget_factor
 
     def _current_mean_reward(self):
         if getattr(self.model, "ep_info_buffer", None):
@@ -403,8 +408,19 @@ class AdaptiveEntropyCallback(BaseCallback):
         old_ent = float(self.model.ent_coef)
         flag_rate = self._current_flag_rate()
         already_winning = flag_rate >= self._flag_rate_threshold
+        peak = self._best_mean_rew
 
-        if already_winning:
+        # 崩盘检测：reward 已远低于峰值 → 熵太高洗策略了，强制归位
+        # 同时把峰值也拉低，避免"永久门槛"挡住后续的突破分支
+        if peak > self._collapse_min_peak and cur < peak * self._collapse_ratio:
+            new_ent = self._base
+            self.model.ent_coef = new_ent
+            self._stale_count = 0
+            self._best_mean_rew = peak * self._collapse_ratio
+            if self.verbose:
+                print("  [自适应熵] 崩盘! reward={:.1f} < 峰值{:.1f}×{:.1f}, 重置 ent_coef: {:.4f} → {:.4f}".format(
+                    cur, peak, self._collapse_ratio, old_ent, new_ent))
+        elif already_winning:
             new_ent = max(self._base, old_ent * self._decay)
             self.model.ent_coef = new_ent
             self._stale_count = 0
@@ -422,6 +438,9 @@ class AdaptiveEntropyCallback(BaseCallback):
                 print("  [自适应熵] 突破! reward={:.1f}, 通关率={:.0%}, ent_coef: {:.4f} → {:.4f}".format(
                     cur, flag_rate, old_ent, new_ent))
         else:
+            # 慢遗忘峰值：防止历史高分永久锁死"突破"分支
+            if self._best_mean_rew > 0:
+                self._best_mean_rew *= self._peak_forget
             self._stale_count += 1
             if self._stale_count >= self._patience:
                 new_ent = min(self._max, old_ent * self._boost)
@@ -518,10 +537,10 @@ def main():
                      base_ent_coef=ENT_COEF,
                      max_ent_coef=ENT_COEF_MAX,
                      check_interval_timesteps=20000,
-                     patience=6,
-                     boost_factor=1.5,
-                     decay_factor=0.9,
-                     min_improvement=2.0,
+                     patience=12,
+                     boost_factor=1.2,
+                     decay_factor=0.85,
+                     min_improvement=10.0,
                      verbose=1,
                  )]
     if RENDER_WHILE_TRAINING:
