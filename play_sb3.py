@@ -47,7 +47,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 # ======================
 # 配置
 # ======================
-PLAY_ENV_ID = "SuperMarioBros-4-4-v1"
+PLAY_ENV_ID = "SuperMarioBros-5-4-v1"
 MODEL_PATH = "./sb3_mario_model.zip"
 ALGORITHM = "PPO"
 N_EPISODES = 5

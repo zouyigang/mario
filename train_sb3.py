@@ -144,7 +144,7 @@ from sb3_device import SB3_DEVICE
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-4-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
+MARIO_ENV_ID = "SuperMarioBros-5-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
@@ -281,6 +281,7 @@ FRONTIER_BONUS = 0.1       # v4：从 0.3 → 0.1，避免在边界来回踱步 
 Y_LAYER_BONUS = 5           # v8：20→5，避免"到新层"信号盖过"在新层先往哪走"
 Y_LAYER_SIZE = 24            # 平台高差阈值（像素）：起跳前 y 与落地 y 之差 ≥ 该值才算到达新层；同时作为落点去重桶 y 粒度
 Y_LAYER_X_BUCKET = 256       # v8.6：32→256（一屏宽），防止同一物理平台横跨多个 x bucket 被反复奖励的漏洞
+Y_LAYER_CONFIRM_DX = 96      # 延迟确认：落到新 y_layer 后必须在下层贴地横向覆盖 ≥ 该值才发奖，防止"跳下去没探索又跳回来"薅分
 
 # ---- 无新探索：v4 缩短到 2 秒触发持续扣分 ----
 # frame_skip=2，~30 step/s → 2 秒 ≈ 60 步
@@ -452,6 +453,7 @@ class CellExplorationWrapper(Wrapper):
                  y_layer_bonus=0.0,
                  y_layer_size=32,
                  y_layer_x_bucket=32,
+                 y_layer_confirm_dx=96,
                  episode_cell_bonus_cap=30.0):
         super().__init__(env)
         self._cell_size = int(cell_size)
@@ -463,10 +465,12 @@ class CellExplorationWrapper(Wrapper):
         self._y_layer_bonus = float(y_layer_bonus)
         self._y_layer_size = int(y_layer_size)
         self._y_layer_x_bucket = int(y_layer_x_bucket)
+        self._y_layer_confirm_dx = int(y_layer_confirm_dx)
         self._episode_cell_bonus_cap = float(episode_cell_bonus_cap)
         self._episode_cell_bonus_total = 0.0
         self._visited = set()
         self._visited_y_layers = set()
+        self._pending_y_layers = []
         self._frontier_used = set()
         self._steps_without_new = 0
         self._last_cell = None
@@ -483,6 +487,7 @@ class CellExplorationWrapper(Wrapper):
         obs, info = self.env.reset(**kwargs)
         self._visited.clear()
         self._visited_y_layers.clear()
+        self._pending_y_layers = []
         self._frontier_used.clear()
         self._steps_without_new = 0
         self._episode_cell_bonus_total = 0.0
@@ -508,12 +513,21 @@ class CellExplorationWrapper(Wrapper):
         cell_changed = prev_cell is not None and cell != prev_cell
         info["cell_changed"] = cell_changed
 
-        # 平台层探索奖励：用起跳前 y 与落地 y 的差值判断是否到达新层平台
-        # dy != 0 视为离地/在空中；连续 2 帧 dy == 0 视为落地（避开跳跃顶点单帧静止误判）
-        # 奖励正比于 Δy / 阈值，单次封顶 4×bonus，使一次大跳与等价的多次小跳收益相同，杜绝拆分 farm
-        # 只奖励往下跳（y > takeoff_y），往上跳回原层不给奖励，防止"跳下再跳上"刷分
+        # 平台层探索奖励（延迟确认 + 级联兑现版）：落到新 y_layer 时"压栈"，
+        # 兑现规则（任一）：
+        #   (a) 最深 pending 的下层贴地横向覆盖 ≥ y_layer_confirm_dx → 级联兑现整栈；
+        #   (b) 不再"压栈即兑现"——必须由 (a) 触发后级联，避免"借更深一跳就把上一层免单确认"。
+        # 丢弃：落地后 y 回到某 pending 的起跳层附近（+半个 layer）→ 废弃该 pending
+        #       并把 bucket 移出 _visited_y_layers，下次真正探索可再拿。
+        # 同时通过 info 暴露 pending 状态，供 ClipReward 层做"缓存-退还"：
+        #   y_layer_pending_active        本步处理后栈是否非空
+        #   y_layer_pending_resolved_confirm  本步是否由确认导致栈被清空
+        #   y_layer_pending_resolved_discard  本步是否由废弃导致栈被清空
+        prev_pending_count = len(self._pending_y_layers)
         dy = y - self._prev_y
         platform_reward = 0.0
+        confirmed_this_step = False
+        landed = False
         if dy != 0:
             if not self._in_air:
                 self._in_air = True
@@ -523,13 +537,57 @@ class CellExplorationWrapper(Wrapper):
             self._stable_streak += 1
             if self._in_air and self._stable_streak >= 2:
                 self._in_air = False
-                delta = y - self._takeoff_y  # 正值=往下跳，负值=往上跳
-                if delta >= self._y_layer_size:  # 只有往下跳才给奖励
-                    bucket = (x // self._y_layer_x_bucket, y // self._y_layer_size)
-                    if bucket not in self._visited_y_layers:
-                        self._visited_y_layers.add(bucket)
-                        mult = min(delta / self._y_layer_size, 4.0)
-                        platform_reward = self._y_layer_bonus * mult
+                landed = True
+
+        if landed:
+            delta = y - self._takeoff_y  # 正值=往下跳
+            if delta >= self._y_layer_size:
+                bucket = (x // self._y_layer_x_bucket, y // self._y_layer_size)
+                if bucket not in self._visited_y_layers:
+                    self._visited_y_layers.add(bucket)
+                    mult = min(delta / self._y_layer_size, 4.0)
+                    self._pending_y_layers.append({
+                        "bucket": bucket,
+                        "reward": self._y_layer_bonus * mult,
+                        "takeoff_y": self._takeoff_y,
+                        "min_x": x,
+                        "max_x": x,
+                    })
+            # 丢弃检查：y 已回到某 pending 的起跳层附近 → 废弃
+            if self._pending_y_layers:
+                thr = self._y_layer_size // 2
+                kept = []
+                for p in self._pending_y_layers:
+                    if y <= p["takeoff_y"] + thr:
+                        self._visited_y_layers.discard(p["bucket"])
+                    else:
+                        kept.append(p)
+                self._pending_y_layers = kept
+
+        # 贴地帧：更新所有 pending 的横向覆盖；只用最深 pending 触发级联确认
+        if (not self._in_air) and self._pending_y_layers:
+            for p in self._pending_y_layers:
+                if y > p["takeoff_y"]:
+                    if x < p["min_x"]:
+                        p["min_x"] = x
+                    if x > p["max_x"]:
+                        p["max_x"] = x
+            deepest = self._pending_y_layers[-1]
+            if (deepest["max_x"] - deepest["min_x"]) >= self._y_layer_confirm_dx:
+                for p in self._pending_y_layers:
+                    platform_reward += p["reward"]
+                self._pending_y_layers = []
+                confirmed_this_step = True
+
+        new_pending_count = len(self._pending_y_layers)
+        info["y_layer_pending_active"] = (new_pending_count > 0)
+        # 只有"栈被清空"才算 resolved；中途丢弃/确认部分 pending 不算
+        if prev_pending_count > 0 and new_pending_count == 0:
+            info["y_layer_pending_resolved_confirm"] = bool(confirmed_this_step)
+            info["y_layer_pending_resolved_discard"] = not confirmed_this_step
+        else:
+            info["y_layer_pending_resolved_confirm"] = False
+            info["y_layer_pending_resolved_discard"] = False
 
         if self._y_layer_bonus > 0 and platform_reward > 0:
             reward += platform_reward
@@ -930,11 +988,17 @@ class ClipRewardExceptDeathWrapper(Wrapper):
         self._episode_positive_accum = 0.0
         # v4：累积本局 stall 扣分（用于日志诊断）
         self._episode_stall_penalty = 0.0
+        # y_layer pending 缓存-退还：在 pending 期间累加最终 reward，
+        # 由 CellExplorationWrapper 通过 info 的 resolve 标志决定提交/退还
+        self._y_pending_buffer = 0.0
+        self._y_pending_buffering = False
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._episode_positive_accum = 0.0
         self._episode_stall_penalty = 0.0
+        self._y_pending_buffer = 0.0
+        self._y_pending_buffering = False
         return obs, info
 
     def step(self, action):
@@ -1040,6 +1104,35 @@ class ClipRewardExceptDeathWrapper(Wrapper):
         # v4 诊断：暴露本局累积 stall 扣分（每步都写，便于终局日志读取）
         info["episode_stall_penalty"] = self._episode_stall_penalty
 
+        # ---- y_layer pending hold-then-release ----
+        # 在最终 reward 组合后、return 前处理：
+        #   - active：pending 期间，本步 reward > 0 时整段进 buffer 并把当前 step 的 reward 改为 0；
+        #             reward ≤ 0（penalty 主导步）正常通过——避免"跳坑没探索却每步发正分"。
+        #   - resolved_confirm：级联确认 → buffer 一次性补发，使之前 hold 住的探索分一次性入账。
+        #   - resolved_discard：栈被废弃 → 直接丢弃 buffer，不补发，净收益归零。
+        #   - terminated/truncated：清空 buffer，死在坑里的累计也丢。
+        info["y_layer_pending_buffered"] = self._y_pending_buffer
+        info["y_layer_pending_release"] = 0.0
+        info["y_layer_pending_held"] = 0.0
+        if info.get("y_layer_pending_resolved_confirm", False):
+            release = self._y_pending_buffer
+            reward += release
+            info["y_layer_pending_release"] = release
+            self._y_pending_buffer = 0.0
+            self._y_pending_buffering = False
+        elif info.get("y_layer_pending_resolved_discard", False):
+            self._y_pending_buffer = 0.0
+            self._y_pending_buffering = False
+        elif info.get("y_layer_pending_active", False):
+            if reward > 0:
+                self._y_pending_buffering = True
+                self._y_pending_buffer += reward
+                info["y_layer_pending_held"] = reward
+                reward = 0.0
+        if terminated or truncated:
+            self._y_pending_buffer = 0.0
+            self._y_pending_buffering = False
+
         return obs, reward, terminated, truncated, info
 
 
@@ -1139,6 +1232,7 @@ def make_env(env_id=None):
             y_layer_bonus=Y_LAYER_BONUS,
             y_layer_size=Y_LAYER_SIZE,
             y_layer_x_bucket=Y_LAYER_X_BUCKET,
+            y_layer_confirm_dx=Y_LAYER_CONFIRM_DX,
             episode_cell_bonus_cap=CELL_BONUS_EPISODE_CAP,
         )
 
