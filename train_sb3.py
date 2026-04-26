@@ -125,7 +125,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数（极简经典配置）
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-2-2-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
+MARIO_ENV_ID = "SuperMarioBros-6-4-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT       # 7 个动作：含 NOOP/左/右/跳/跑跳，等待和后退都需要
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
@@ -134,9 +134,9 @@ FRAME_SIZE = 84
 FRAME_STACK = 4
 TOTAL_TIMESTEPS = 20_000_000
 
-# 奖励设计：极简三档——前进(+1) / 后退(-1) / 死亡(-15) / 通关(+50)
-# 正常步用 np.sign 裁剪，等待时 reward=0 不扣分——这就是"允许等待"的关键
-DEATH_PENALTY_SEEN = 15      # 死亡惩罚。15 = 只需前进 15 步就能回本，冒险跨坑是划算的
+# 奖励设计：正常步 = clip(底层 Δx, -3, +3) / 死亡(-15) / 通关(+50 + 速度)
+# 不能用 np.sign：会把"覆盖距离"扭成"出现正 Δx 的步数"，慢速高跳每个滞空帧都拿满 +1 → 刷分
+DEATH_PENALTY_SEEN = 25      # 死亡惩罚。15 = 只需前进 15 步就能回本，冒险跨坑是划算的
 FLAG_GET_BONUS = 50           # 通关额外奖励，远大于死亡惩罚，鼓励冲终点
 
 # 死循环检测
@@ -188,6 +188,22 @@ def _get_mario_x_from_env(env):
     return 0
 
 
+def _get_mario_y_from_env(env):
+    """从任意一层包装中解包到底层 NES 环境，读取马里奥纵向位置。"""
+    e = env
+    while e is not None:
+        if hasattr(e, "_y_position"):
+            try:
+                return int(e._y_position)
+            except Exception:
+                return 0
+        if hasattr(e, "gym_env"):
+            e = e.gym_env
+        else:
+            e = getattr(e, "env", None)
+    return 0
+
+
 class DeadLoopDetector(Wrapper):
     """连续 N 步横向无进展则强制 truncated=True 结束本局。"""
 
@@ -221,8 +237,9 @@ class DeadLoopDetector(Wrapper):
 
 class SimpleRewardWrapper(Wrapper):
     """
-    极简奖励 + 通关速度奖励：
-    - 正常步：np.sign(reward) → +1(前进) / 0(原地) / -1(后退)
+    奖励 + 通关速度奖励：
+    - 正常步：clip(底层 Δx 奖励, -step_clip, +step_clip)。
+      累计总分 ≈ max_x - start_x，与步数无关，避免滞空刷分。
     - 死亡步：-death_penalty
     - 死循环超时：-dead_loop_penalty
     - 通关：flag_bonus + max(0, speed_base_steps - 已用步数) × speed_per_step
@@ -231,7 +248,8 @@ class SimpleRewardWrapper(Wrapper):
 
     def __init__(self, env, death_threshold=-15, death_penalty=15,
                  dead_loop_penalty=5, flag_bonus=50,
-                 speed_base_steps=500, speed_per_step=1.5):
+                 speed_base_steps=500, speed_per_step=1.5,
+                 step_clip=15.0, step_penalty=0.15):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
         self._death_penalty = float(death_penalty)
@@ -239,6 +257,8 @@ class SimpleRewardWrapper(Wrapper):
         self._flag_bonus = float(flag_bonus)
         self._speed_base = int(speed_base_steps)
         self._speed_per_step = float(speed_per_step)
+        self._step_clip = float(step_clip)
+        self._step_penalty = float(step_penalty)
         self._steps = 0
 
     def reset(self, **kwargs):
@@ -266,7 +286,11 @@ class SimpleRewardWrapper(Wrapper):
             speed_bonus = max(0, self._speed_base - self._steps) * self._speed_per_step
             reward = self._flag_bonus + speed_bonus
         else:
-            reward = float(np.sign(reward))
+            # 阈值 ≥ 平地最大 Δx/skip(~10-12)，保证快跑不被裁剪；
+            # ×0.1 把量级压回 ~±1。总分 ≈ Δx 总和，与 airtime 解耦。
+            # 再扣固定 step_penalty：每多走一步直接亏分，让 slow 路线总分严格低于 fast。
+            reward = float(np.clip(reward, -self._step_clip, self._step_clip)) * 0.1
+            reward -= self._step_penalty
 
         return obs, reward, terminated, truncated, info
 
@@ -552,7 +576,7 @@ def main():
     print("🚀 开始训练（SB3 + PPO + 马里奥，从头训）...")
     print("关卡: {} | 动作集: {} 个 | 帧跳过: {} | 并行环境: {}".format(
         MARIO_ENV_ID, len(MOVEMENT_ACTIONS), FRAME_SKIP, NUM_ENVS))
-    print("奖励: 前进+1 | 原地0 | 后退-1 | 死亡-{} | 通关+{}+速度奖励(基准{}步,每省1步+{})".format(
+    print("奖励: 正常步 clip(Δx,-3,+3) | 死亡-{} | 通关+{}+速度奖励(基准{}步,每省1步+{})".format(
         DEATH_PENALTY_SEEN, FLAG_GET_BONUS, SPEED_BONUS_BASE_STEPS, SPEED_BONUS_PER_STEP))
     print("本轮将训练 {} 步".format(TOTAL_TIMESTEPS))
     print("Episode 列 | ent=当前 PPO 熵系数（自适应回调会动态修改）")
