@@ -125,7 +125,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数（极简经典配置）
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-6-4-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
+MARIO_ENV_ID = "SuperMarioBros-3-4-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT       # 7 个动作：含 NOOP/左/右/跳/跑跳，等待和后退都需要
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
@@ -147,7 +147,7 @@ DEAD_LOOP_PENALTY_SEEN = 5
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
 # 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
 # BASE 要大于「该关正常快通步数 + 可能出现的蹭分步数」，否则快通已贴顶、蹭分只靠多走 +1 会反超
-SPEED_BONUS_BASE_STEPS = 700
+SPEED_BONUS_BASE_STEPS = 400
 SPEED_BONUS_PER_STEP = 1.5
 
 # PPO 超参

@@ -24,7 +24,7 @@ finally:
 from train_sb3 import make_env, MOVEMENT_ACTIONS, _get_mario_x_from_env
 
 # 演示关卡（与 play_sb3 类似，可改 v3 等与训练一致）
-PLAY_ENV_ID = "SuperMarioBros-6-4-v1"
+PLAY_ENV_ID = "SuperMarioBros-3-4-v1"
 FRAME_DELAY_SEC = 0.06
 HUD_WIN = "Human play — x / reward"
 
