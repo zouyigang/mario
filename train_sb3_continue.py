@@ -126,7 +126,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-3-4-v1"   # 目标关卡
+MARIO_ENV_ID = "SuperMarioBros-4-2-v1"   # 目标关卡
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
@@ -250,7 +250,7 @@ class SimpleRewardWrapper(Wrapper):
     def __init__(self, env, death_threshold=-15, death_penalty=15,
                  dead_loop_penalty=5, flag_bonus=50,
                  speed_base_steps=500, speed_per_step=1.5,
-                 step_clip=15.0, step_penalty=0.15):
+                 step_clip=15.0, step_penalty=0.3):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
         self._death_penalty = float(death_penalty)
