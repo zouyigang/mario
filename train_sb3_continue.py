@@ -126,7 +126,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-4-2-v1"   # 目标关卡
+MARIO_ENV_ID = "SuperMarioBros-5-4-v1"   # 目标关卡
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
@@ -141,22 +141,22 @@ FLAG_GET_BONUS = 50
 # 死循环检测
 DEAD_LOOP_STEPS = 500
 DEAD_LOOP_MIN_DX = 8
-DEAD_LOOP_PENALTY_SEEN = 5
+DEAD_LOOP_PENALTY_SEEN = 50
 
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
 # 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
 # BASE 要大于「该关正常快通步数 + 可能出现的蹭分步数」，否则快通已贴顶、蹭分只靠多走 +1 会反超
-SPEED_BONUS_BASE_STEPS = 400
-SPEED_BONUS_PER_STEP = 1.5
+SPEED_BONUS_BASE_STEPS = 500
+SPEED_BONUS_PER_STEP = 2
 
 # 加载模型
 LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
-ADDITIONAL_TIMESTEPS = 20_000_000
+ADDITIONAL_TIMESTEPS = 8_000_000
 
 # 接着训的 PPO 超参（比从头训稍保守）
-ENT_COEF_CONTINUE = 0.005
+ENT_COEF_CONTINUE = 0.01
 # 自适应熵回调里 ent_coef 的上限；7 动作空间 0.2 会把 logits 抹平导致策略崩塌
-ENT_COEF_MAX = 0.01
+ENT_COEF_MAX = 0.05
 LR_CONTINUE = 3e-5
 LR_CONTINUE_END = 1e-5
 USE_LR_DECAY_CONTINUE = True
@@ -250,7 +250,7 @@ class SimpleRewardWrapper(Wrapper):
     def __init__(self, env, death_threshold=-15, death_penalty=15,
                  dead_loop_penalty=5, flag_bonus=50,
                  speed_base_steps=500, speed_per_step=1.5,
-                 step_clip=15.0, step_penalty=0.3):
+                 step_clip=15.0, step_penalty=0.8):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
         self._death_penalty = float(death_penalty)
