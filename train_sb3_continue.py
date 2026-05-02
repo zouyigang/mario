@@ -126,7 +126,7 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-5-4-v1"   # 目标关卡
+MARIO_ENV_ID = "SuperMarioBros-7-4-v1"   # 目标关卡
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
