@@ -137,11 +137,16 @@ FRAME_STACK = 4
 # 奖励：与 train_sb3.py 完全一致
 DEATH_PENALTY_SEEN = 15
 FLAG_GET_BONUS = 50
+STEP_PENALTY_SEEN = 0.08       # 普通步小惩罚；向右正常推进应为正分，停顿/慢蹭仍亏分
 
 # 死循环检测
 DEAD_LOOP_STEPS = 500
 DEAD_LOOP_MIN_DX = 8
 DEAD_LOOP_PENALTY_SEEN = 50
+
+# 7-4 分支回传检测：x 相对本局 max_x 明显骤降，视为走错分支并立即结束本局
+WARP_BACK_MIN_DROP = 96
+WARP_BACK_PENALTY_SEEN = 25
 
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
 # 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
@@ -236,25 +241,56 @@ class DeadLoopDetector(Wrapper):
         return obs, reward, terminated, truncated, info
 
 
+class WarpBackDetector(Wrapper):
+    """7-4 走错分支时会被回传；检测 x 相对 max_x 的骤降并结束本局。"""
+
+    def __init__(self, env, min_drop):
+        super().__init__(env)
+        self._min_drop = int(min_drop)
+        self._max_x_seen = 0
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._max_x_seen = _get_mario_x_from_env(self.env)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        current_x = _get_mario_x_from_env(self.env)
+
+        if current_x > self._max_x_seen:
+            self._max_x_seen = current_x
+
+        info["max_x"] = self._max_x_seen
+        if self._min_drop > 0 and self._max_x_seen - current_x >= self._min_drop:
+            truncated = True
+            info["warp_back"] = True
+            info["warp_back_drop"] = self._max_x_seen - current_x
+
+        return obs, reward, terminated, truncated, info
+
+
 class SimpleRewardWrapper(Wrapper):
     """
     奖励 + 通关速度奖励：
     - 正常步：clip(底层 Δx 奖励, -step_clip, +step_clip)。
       累计总分 ≈ max_x - start_x，与步数无关，避免滞空刷分。
     - 死亡步：-death_penalty
+    - 分支回传：-warp_back_penalty
     - 死循环超时：-dead_loop_penalty
     - 通关：flag_bonus + max(0, speed_base_steps - 已用步数) × speed_per_step
       越快通关奖励越高，每多蹭一步就少拿 speed_per_step 分（>1.0 时蹭分严格亏损）
     """
 
     def __init__(self, env, death_threshold=-15, death_penalty=15,
-                 dead_loop_penalty=5, flag_bonus=50,
+                 dead_loop_penalty=5, warp_back_penalty=80, flag_bonus=50,
                  speed_base_steps=500, speed_per_step=1.5,
                  step_clip=15.0, step_penalty=0.8):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
         self._death_penalty = float(death_penalty)
         self._dead_loop_penalty = float(dead_loop_penalty)
+        self._warp_back_penalty = float(warp_back_penalty)
         self._flag_bonus = float(flag_bonus)
         self._speed_base = int(speed_base_steps)
         self._speed_per_step = float(speed_per_step)
@@ -271,21 +307,25 @@ class SimpleRewardWrapper(Wrapper):
         self._steps += 1
 
         is_dead_loop = info.get("dead_loop", False)
+        is_warp_back = info.get("warp_back", False)
         is_flag = info.get("flag_get", False)
 
         is_death = (
             not is_dead_loop
+            and not is_warp_back
             and not is_flag
             and (reward <= self._death_threshold or terminated)
         )
 
-        if is_dead_loop:
+        if is_flag:
+            speed_bonus = max(0, self._speed_base - self._steps) * self._speed_per_step
+            reward = self._flag_bonus + speed_bonus
+        elif is_warp_back:
+            reward = -self._warp_back_penalty
+        elif is_dead_loop:
             reward = -self._dead_loop_penalty
         elif is_death:
             reward = -self._death_penalty
-        elif is_flag:
-            speed_bonus = max(0, self._speed_base - self._steps) * self._speed_per_step
-            reward = self._flag_bonus + speed_bonus
         else:
             # 阈值 ≥ 平地最大 Δx/skip(~10-12)，保证快跑不被裁剪；
             # ×0.1 把量级压回 ~±1。总分 ≈ Δx 总和，与 airtime 解耦。
@@ -313,6 +353,8 @@ def make_env(env_id=None):
 
     if DEAD_LOOP_STEPS > 0:
         env = DeadLoopDetector(env, no_progress_max_steps=DEAD_LOOP_STEPS, min_dx=DEAD_LOOP_MIN_DX)
+    if WARP_BACK_MIN_DROP > 0:
+        env = WarpBackDetector(env, min_drop=WARP_BACK_MIN_DROP)
 
     env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
     env = WarpFrame(env, width=FRAME_SIZE, height=FRAME_SIZE)
@@ -321,9 +363,11 @@ def make_env(env_id=None):
         death_threshold=-15,
         death_penalty=DEATH_PENALTY_SEEN,
         dead_loop_penalty=DEAD_LOOP_PENALTY_SEEN,
+        warp_back_penalty=WARP_BACK_PENALTY_SEEN,
         flag_bonus=FLAG_GET_BONUS,
         speed_base_steps=SPEED_BONUS_BASE_STEPS,
         speed_per_step=SPEED_BONUS_PER_STEP,
+        step_penalty=STEP_PENALTY_SEEN,
     )
     env = Monitor(env)
     return env
@@ -491,7 +535,10 @@ class EpisodeLogCallback(BaseCallback):
                 self.episode_count += 1
                 r = info["episode"]["r"]
                 l = info["episode"]["l"]
-                if info.get("dead_loop"):
+                max_x = int(info.get("max_x", 0))
+                if info.get("warp_back"):
+                    suffix = "  [分支回传 drop={}]".format(int(info.get("warp_back_drop", 0)))
+                elif info.get("dead_loop"):
                     suffix = "  [循环超时]"
                 elif info.get("flag_get"):
                     speed_b = max(0, SPEED_BONUS_BASE_STEPS - int(l)) * SPEED_BONUS_PER_STEP
@@ -501,8 +548,8 @@ class EpisodeLogCallback(BaseCallback):
                 ec = getattr(self.model, "ent_coef", None)
                 ent_s = "ent={:.4f}".format(float(ec)) if ec is not None else "ent=N/A"
                 print(
-                    "Episode {:4d} | Reward: {:6.1f} | Steps: {} | Total Steps: {} | {} |{}".format(
-                        self.episode_count, r, int(l), total_env_steps, ent_s, suffix
+                    "Episode {:4d} | Reward: {:6.1f} | Steps: {} | MaxX: {} | Total Steps: {} | {} |{}".format(
+                        self.episode_count, r, int(l), max_x, total_env_steps, ent_s, suffix
                     )
                 )
         return True
