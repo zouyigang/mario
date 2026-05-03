@@ -1,4 +1,4 @@
-# ======================
+﻿# ======================
 # 马里奥强化学习训练脚本（从头训练）
 # ======================
 # 用途：从零开始训练，不加载已有模型。
@@ -143,11 +143,18 @@ STEP_PENALTY_SEEN = 0.05       # 普通步小惩罚；向右正常推进应为�
 # 死循环检测
 DEAD_LOOP_STEPS = 500        # 约 33 秒无进展才结束（为传送台/电梯留足时间）
 DEAD_LOOP_MIN_DX = 8
-DEAD_LOOP_PENALTY_SEEN = 50
+DEAD_LOOP_PENALTY_SEEN = 80
 
 # 7-4 分支回传检测：x 相对本局 max_x 明显骤降，视为走错分支并立即结束本局
 WARP_BACK_MIN_DROP = 96
 WARP_BACK_PENALTY_SEEN = 20
+
+# 7-4 分支里程碑（PBRS）：max_x 首次跨过列表中的阈值时发一次正奖励
+# 用途：通关只在最后给信号，分支判断收不到局部反馈；这里给"刚选对了第 k 个分支"提供即时信号
+# 调参：手动观察 7-4，把每个正确分支后的稳定 x 坐标列入此列表（按递增顺序）
+# 实现：累计计数单调递增，跨同一阈值不重复发；穿透 MaxAndSkipEnv 也能完整保留
+MILESTONE_THRESHOLDS = [1500, 2500]
+MILESTONE_BONUS = 80.0
 
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
 # 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
@@ -241,16 +248,21 @@ class DeadLoopDetector(Wrapper):
 
 
 class WarpBackDetector(Wrapper):
-    """7-4 走错分支时会被回传；检测 x 相对 max_x 的骤降并结束本局。"""
+    """7-4 走错分支时会被回传；检测 x 相对 max_x 的骤降并结束本局。
+    同时维护"分支里程碑"计数：max_x 跨过预设阈值的次数（PBRS 信号）。
+    """
 
-    def __init__(self, env, min_drop):
+    def __init__(self, env, min_drop, milestones=None):
         super().__init__(env)
         self._min_drop = int(min_drop)
+        self._milestones = sorted([int(x) for x in (milestones or [])])
         self._max_x_seen = 0
+        self._crossed_count = 0
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._max_x_seen = _get_mario_x_from_env(self.env)
+        self._crossed_count = 0
         return obs, info
 
     def step(self, action):
@@ -260,7 +272,15 @@ class WarpBackDetector(Wrapper):
         if current_x > self._max_x_seen:
             self._max_x_seen = current_x
 
+        # 单调累计：max_x 一旦跨过下一个阈值就 +1，永不回退；
+        # 用计数而非 per-step 标志，是为了穿透 MaxAndSkipEnv 只保留最后一帧 info 的限制
+        while (self._crossed_count < len(self._milestones)
+               and self._max_x_seen >= self._milestones[self._crossed_count]):
+            self._crossed_count += 1
+
         info["max_x"] = self._max_x_seen
+        info["milestones_crossed"] = self._crossed_count
+
         if self._min_drop > 0 and self._max_x_seen - current_x >= self._min_drop:
             truncated = True
             info["warp_back"] = True
@@ -284,7 +304,7 @@ class SimpleRewardWrapper(Wrapper):
     def __init__(self, env, death_threshold=-15, death_penalty=15,
                  dead_loop_penalty=5, warp_back_penalty=80, flag_bonus=50,
                  speed_base_steps=500, speed_per_step=1.5,
-                 step_clip=15.0, step_penalty=0.8):
+                 step_clip=15.0, step_penalty=0.8, milestone_bonus=0.0):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
         self._death_penalty = float(death_penalty)
@@ -295,10 +315,13 @@ class SimpleRewardWrapper(Wrapper):
         self._speed_per_step = float(speed_per_step)
         self._step_clip = float(step_clip)
         self._step_penalty = float(step_penalty)
+        self._milestone_bonus = float(milestone_bonus)
         self._steps = 0
+        self._last_milestones = 0
 
     def reset(self, **kwargs):
         self._steps = 0
+        self._last_milestones = 0
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -332,6 +355,20 @@ class SimpleRewardWrapper(Wrapper):
             reward = float(np.clip(reward, -self._step_clip, self._step_clip)) * 0.1
             reward -= self._step_penalty
 
+        # PBRS 里程碑奖励：在 clip 之后叠加，避免 ±step_clip 把 +80 抹成 +1.5
+        # 终结步（flag/warp_back/death）也允许叠加：跨阈值在前、终结在后，应当承认这次跨越
+        if self._milestone_bonus > 0.0:
+            crossed = int(info.get("milestones_crossed", 0))
+            new_crossings = crossed - self._last_milestones
+            if new_crossings > 0 and not is_warp_back:
+                bonus = new_crossings * self._milestone_bonus
+                reward += bonus
+                info["milestone_bonus"] = bonus
+                self._last_milestones = crossed
+            elif new_crossings > 0:
+                # warp_back 时跨过阈值通常是因为 max_x 在前几步刚被推过去，回传不应给奖励
+                self._last_milestones = crossed
+
         return obs, reward, terminated, truncated, info
 
 
@@ -356,7 +393,7 @@ def make_env(env_id=None):
     if DEAD_LOOP_STEPS > 0:
         env = DeadLoopDetector(env, no_progress_max_steps=DEAD_LOOP_STEPS, min_dx=DEAD_LOOP_MIN_DX)
     if WARP_BACK_MIN_DROP > 0:
-        env = WarpBackDetector(env, min_drop=WARP_BACK_MIN_DROP)
+        env = WarpBackDetector(env, min_drop=WARP_BACK_MIN_DROP, milestones=MILESTONE_THRESHOLDS)
 
     env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
     env = WarpFrame(env, width=FRAME_SIZE, height=FRAME_SIZE)
@@ -370,6 +407,7 @@ def make_env(env_id=None):
         speed_base_steps=SPEED_BONUS_BASE_STEPS,
         speed_per_step=SPEED_BONUS_PER_STEP,
         step_penalty=STEP_PENALTY_SEEN,
+        milestone_bonus=MILESTONE_BONUS,
     )
     env = Monitor(env)
     return env
@@ -539,6 +577,7 @@ class EpisodeLogCallback(BaseCallback):
                 r = info["episode"]["r"]
                 l = info["episode"]["l"]
                 max_x = int(info.get("max_x", 0))
+                ms = int(info.get("milestones_crossed", 0))
                 if info.get("warp_back"):
                     suffix = "  [分支回传 drop={}]".format(int(info.get("warp_back_drop", 0)))
                 elif info.get("dead_loop"):
@@ -550,9 +589,10 @@ class EpisodeLogCallback(BaseCallback):
                     suffix = "  [死亡/其他]"
                 ec = getattr(self.model, "ent_coef", None)
                 ent_s = "ent={:.4f}".format(float(ec)) if ec is not None else "ent=N/A"
+                ms_tail = "  MS={}/{}".format(ms, len(MILESTONE_THRESHOLDS)) if ms > 0 else ""
                 print(
-                    "Episode {:4d} | Reward: {:6.1f} | Steps: {} | MaxX: {} | Total Steps: {} | {} |{}".format(
-                        self.episode_count, r, int(l), max_x, total_env_steps, ent_s, suffix
+                    "Episode {:4d} | Reward: {:6.1f} | Steps: {} | MaxX: {} | Total Steps: {} | {} |{}{}".format(
+                        self.episode_count, r, int(l), max_x, total_env_steps, ent_s, suffix, ms_tail
                     )
                 )
         return True
@@ -625,6 +665,8 @@ def main():
         MARIO_ENV_ID, len(MOVEMENT_ACTIONS), FRAME_SKIP, NUM_ENVS))
     print("奖励: 正常步 clip(Δx,-3,+3) | 死亡-{} | 通关+{}+速度奖励(基准{}步,每省1步+{})".format(
         DEATH_PENALTY_SEEN, FLAG_GET_BONUS, SPEED_BONUS_BASE_STEPS, SPEED_BONUS_PER_STEP))
+    print("分支里程碑(PBRS): 阈值={} | 每跨一个 +{:.0f}".format(
+        MILESTONE_THRESHOLDS, MILESTONE_BONUS))
     print("本轮将训练 {} 步".format(TOTAL_TIMESTEPS))
     print("Episode 列 | ent=当前 PPO 熵系数（自适应回调会动态修改）")
     print("-" * 88)
