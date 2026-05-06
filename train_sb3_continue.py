@@ -135,9 +135,9 @@ FRAME_SIZE = 84
 FRAME_STACK = 4
 
 # 奖励：与 train_sb3.py 完全一致
-DEATH_PENALTY_SEEN = 15
+DEATH_PENALTY_SEEN = 50
 FLAG_GET_BONUS = 50
-STEP_PENALTY_SEEN = 0.08       # 普通步小惩罚；向右正常推进应为正分，停顿/慢蹭仍亏分
+STEP_PENALTY_SEEN = 0.1       # 普通步小惩罚；向右正常推进应为正分，停顿/慢蹭仍亏分
 
 # 死循环检测
 DEAD_LOOP_STEPS = 500
@@ -148,11 +148,14 @@ DEAD_LOOP_PENALTY_SEEN = 80
 WARP_BACK_MIN_DROP = 96
 WARP_BACK_PENALTY_SEEN = 20
 
-# 7-4 分支里程碑（PBRS）：max_x 首次跨过列表中的阈值时发一次正奖励
+# 7-4 分支里程碑（PBRS）：首次到达列表中的 (x, y) 点附近时发一次正奖励
 # 用途：通关只在最后给信号，分支判断收不到局部反馈；这里给"刚选对了第 k 个分支"提供即时信号
-# 调参：手动观察 7-4，把每个正确分支后的稳定 x 坐标列入此列表（按递增顺序）
-# 实现：累计计数单调递增，跨同一阈值不重复发；穿透 MaxAndSkipEnv 也能完整保留
-MILESTONE_THRESHOLDS = [1500, 2500]
+# 调参：手动观察 7-4，把每个正确分支后的稳定 (x, y) 坐标列入此列表（按 x 递增顺序）
+#       y 是马里奥纵坐标（NES：值越小越靠上），MILESTONE_Y_TOLERANCE 控制纵向容差像素
+# 触发条件：max_x_seen >= x_target 且 |current_y - y_target| <= MILESTONE_Y_TOLERANCE
+# 实现：按顺序累计单调递增，到达同一里程碑不重复发；穿透 MaxAndSkipEnv 也能完整保留
+MILESTONE_POINTS = [(450, 128), (880, 128), (1130, 64), (1500, 128), (1590, 64), (1910, 64), (2000, 128), (2120, 64), (2500, 128)]
+MILESTONE_Y_TOLERANCE = 32
 MILESTONE_BONUS = 80.0
 
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
@@ -163,12 +166,12 @@ SPEED_BONUS_PER_STEP = 2
 
 # 加载模型
 LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
-ADDITIONAL_TIMESTEPS = 8_000_000
+ADDITIONAL_TIMESTEPS = 10_000_000
 
 # 接着训的 PPO 超参（比从头训稍保守）
-ENT_COEF_CONTINUE = 0.005
+ENT_COEF_CONTINUE = 0.02
 # 自适应熵回调里 ent_coef 的上限；7 动作空间 0.2 会把 logits 抹平导致策略崩塌
-ENT_COEF_MAX = 0.08
+ENT_COEF_MAX = 0.12
 LR_CONTINUE = 1e-4
 LR_CONTINUE_END = 1e-5
 USE_LR_DECAY_CONTINUE = True
@@ -253,34 +256,48 @@ class WarpBackDetector(Wrapper):
     同时维护"分支里程碑"计数：max_x 跨过预设阈值的次数（PBRS 信号）。
     """
 
-    def __init__(self, env, min_drop, milestones=None):
+    def __init__(self, env, min_drop, milestones=None, y_tolerance=32):
         super().__init__(env)
         self._min_drop = int(min_drop)
-        self._milestones = sorted([int(x) for x in (milestones or [])])
+        # 里程碑：(x, y) 元组，按 x 升序
+        self._milestones = sorted(
+            [(int(p[0]), int(p[1])) for p in (milestones or [])],
+            key=lambda p: p[0],
+        )
+        self._y_tol = int(y_tolerance)
         self._max_x_seen = 0
-        self._crossed_count = 0
+        self._next_idx = 0       # 下一条待判定的里程碑索引（永不回退）
+        self._awarded_count = 0  # 通过 y 判定、应计入奖励的里程碑数
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._max_x_seen = _get_mario_x_from_env(self.env)
-        self._crossed_count = 0
+        self._next_idx = 0
+        self._awarded_count = 0
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         current_x = _get_mario_x_from_env(self.env)
+        current_y = _get_mario_y_from_env(self.env)
 
         if current_x > self._max_x_seen:
             self._max_x_seen = current_x
 
-        # 单调累计：max_x 一旦跨过下一个阈值就 +1，永不回退；
-        # 用计数而非 per-step 标志，是为了穿透 MaxAndSkipEnv 只保留最后一帧 info 的限制
-        while (self._crossed_count < len(self._milestones)
-               and self._max_x_seen >= self._milestones[self._crossed_count]):
-            self._crossed_count += 1
+        # 同步快照判定：x 首次越过 x_target 的那一帧立刻看 y。
+        # 通过 → 计入奖励；不通过 → 永久作废，绝不在后续位置补领（防止错分支后掉落到容差 y 也拿分）。
+        # 本 wrapper 位于 MaxAndSkipEnv 之前，逐帧调用，能看到精确跨越点。
+        while self._next_idx < len(self._milestones):
+            x_t, y_t = self._milestones[self._next_idx]
+            if self._max_x_seen < x_t:
+                break
+            self._next_idx += 1
+            if abs(current_y - y_t) <= self._y_tol:
+                self._awarded_count += 1
 
         info["max_x"] = self._max_x_seen
-        info["milestones_crossed"] = self._crossed_count
+        info["mario_y"] = current_y
+        info["milestones_crossed"] = self._awarded_count
 
         if self._min_drop > 0 and self._max_x_seen - current_x >= self._min_drop:
             truncated = True
@@ -391,7 +408,12 @@ def make_env(env_id=None):
     if DEAD_LOOP_STEPS > 0:
         env = DeadLoopDetector(env, no_progress_max_steps=DEAD_LOOP_STEPS, min_dx=DEAD_LOOP_MIN_DX)
     if WARP_BACK_MIN_DROP > 0:
-        env = WarpBackDetector(env, min_drop=WARP_BACK_MIN_DROP, milestones=MILESTONE_THRESHOLDS)
+        env = WarpBackDetector(
+            env,
+            min_drop=WARP_BACK_MIN_DROP,
+            milestones=MILESTONE_POINTS,
+            y_tolerance=MILESTONE_Y_TOLERANCE,
+        )
 
     env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
     env = WarpFrame(env, width=FRAME_SIZE, height=FRAME_SIZE)
@@ -586,7 +608,7 @@ class EpisodeLogCallback(BaseCallback):
                     suffix = "  [死亡/其他]"
                 ec = getattr(self.model, "ent_coef", None)
                 ent_s = "ent={:.4f}".format(float(ec)) if ec is not None else "ent=N/A"
-                ms_tail = "  MS={}/{}".format(ms, len(MILESTONE_THRESHOLDS)) if ms > 0 else ""
+                ms_tail = "  MS={}/{}".format(ms, len(MILESTONE_POINTS)) if ms > 0 else ""
                 print(
                     "Episode {:4d} | Reward: {:6.1f} | Steps: {} | MaxX: {} | Total Steps: {} | {} |{}{}".format(
                         self.episode_count, r, int(l), max_x, total_env_steps, ent_s, suffix, ms_tail
@@ -677,8 +699,8 @@ def main():
         MARIO_ENV_ID, len(MOVEMENT_ACTIONS), FRAME_SKIP, NUM_ENVS))
     print("奖励: 正常步 clip(Δx,-3,+3) | 死亡-{} | 通关+{}+速度奖励(基准{}步,每省1步+{})".format(
         DEATH_PENALTY_SEEN, FLAG_GET_BONUS, SPEED_BONUS_BASE_STEPS, SPEED_BONUS_PER_STEP))
-    print("分支里程碑(PBRS): 阈值={} | 每跨一个 +{:.0f}".format(
-        MILESTONE_THRESHOLDS, MILESTONE_BONUS))
+    print("分支里程碑(PBRS): 点(x,y)={} y容差={} | 每到一个 +{:.0f}".format(
+        MILESTONE_POINTS, MILESTONE_Y_TOLERANCE, MILESTONE_BONUS))
     print("本轮将再训练 {} 步".format(ADDITIONAL_TIMESTEPS))
     print("Episode 列 | ent=当前 PPO 熵系数（自适应回调会动态修改）")
     print("-" * 88)

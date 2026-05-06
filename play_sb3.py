@@ -101,17 +101,19 @@ def _fmt(v, width=8, prec=2, sign=True):
 
 def _render_panel(panel_h, info, action, reward, total_reward,
                   episode, step_idx, buf_pos, buf_len, live_idx,
-                  paused, frame_delay, x, y, totals, last_event_log):
+                  paused, frame_delay, x, y, totals, last_event_log,
+                  help_lines=None):
     img = np.full((panel_h, PANEL_WIDTH, 3), PANEL_BG, dtype=np.uint8)
     line_h = 18
     y0 = 22
 
     # 先把底部 help 区域的顶边算出来，后续每段绘制都拿它做下限，避免文字重叠
-    help_lines = [
-        "[Space] pause   [N/->] next   [P/<-] prev",
-        "[E] live edge   [R] reset     [+/-] speed",
-        "[Q/Esc] quit",
-    ]
+    if help_lines is None:
+        help_lines = [
+            "[Space] pause   [N/->] next   [P/<-] prev",
+            "[E] live edge   [R] reset     [+/-] speed",
+            "[Q/Esc] quit",
+        ]
     help_line_h = line_h - 2
     help_block_h = len(help_lines) * help_line_h + 6
     help_top = panel_h - help_block_h - 4
