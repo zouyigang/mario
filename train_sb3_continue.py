@@ -1,4 +1,4 @@
-# ======================
+﻿# ======================
 # 马里奥强化学习训练脚本（接着训练）
 # ======================
 # 用途：加载已有 best/checkpoint 在此基础上继续训练（可换关卡）。
@@ -126,8 +126,8 @@ from gymnasium import Wrapper
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-5-4-v1"   # 目标关卡
-MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
+MARIO_ENV_ID = "SuperMarioBros-8-4-v1"   # 目标关卡
+MOVEMENT_ACTIONS = COMPLEX_MOVEMENT
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
 FRAME_SKIP = 4

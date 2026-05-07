@@ -1,4 +1,4 @@
-# ======================
+﻿# ======================
 # 马里奥强化学习训练脚本（从头训练）
 # ======================
 # 用途：从零开始训练，不加载已有模型。
@@ -125,8 +125,8 @@ from gymnasium import Wrapper
 # ======================
 # 超参数（极简经典配置）
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-5-4-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
-MOVEMENT_ACTIONS = SIMPLE_MOVEMENT       # 7 个动作：含 NOOP/左/右/跳/跑跳，等待和后退都需要
+MARIO_ENV_ID = "SuperMarioBros-8-4-v1"   # 先用 1-1 验证训练流程，通关后再换 5-3
+MOVEMENT_ACTIONS = COMPLEX_MOVEMENT       # 7 个动作：含 NOOP/左/右/跳/跑跳，等待和后退都需要
 NUM_ENVS = 16
 USE_SUBPROC_VEC_ENV = True
 FRAME_SKIP = 4       # 标准 Atari 跳帧，经过广泛验证
