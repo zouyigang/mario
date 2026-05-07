@@ -3,7 +3,11 @@
 # ======================
 # 运行: python play_human.py
 # Windows：用 GetAsyncKeyState 读键，游戏窗口可有焦点；其它系统需: pip install pygame 并聚焦 pygame 提示窗口。
-# 键位（与 SIMPLE_MOVEMENT 一致）：←/A 向左，→/D 向右，空格/W 跳，右+跳=向右跳；Shift+右=加速跑，Shift+右+跳=跑跳
+# 键位（与 COMPLEX_MOVEMENT 一致，共 12 个动作）：
+#   ←/A 向左，→/D 向右，空格/W 跳，↓/S 蹲下（进水管），↑ 朝上
+#   右+跳=向右跳；Shift+右=向右跑；Shift+右+跳=向右跑跳
+#   左+跳=向左跳；Shift+左=向左跑；Shift+左+跳=向左跑跳
+#   蹲下（↓）优先级最高：按下 ↓ 即立即蹲下，便于在水管上方进水管
 
 import os
 import sys
@@ -24,7 +28,7 @@ finally:
 from train_sb3 import make_env, MOVEMENT_ACTIONS, _get_mario_x_from_env
 
 # 演示关卡（与 play_sb3 类似，可改 v3 等与训练一致）
-PLAY_ENV_ID = "SuperMarioBros-2-1-v1"
+PLAY_ENV_ID = "SuperMarioBros-8-4-v1"
 FRAME_DELAY_SEC = 0.06
 HUD_WIN = "Human play — x / reward"
 
@@ -56,6 +60,7 @@ if platform.system() == "Windows":
         "SHIFT": 0x10,
         "A": 0x41,
         "D": 0x44,
+        "S": 0x53,
         "W": 0x57,
         "Q": 0x51,
     }
@@ -63,8 +68,18 @@ if platform.system() == "Windows":
     def read_action_index() -> int:
         left = _async_down(VK["LEFT"]) or _async_down(VK["A"])
         right = _async_down(VK["RIGHT"]) or _async_down(VK["D"])
-        jump = _async_down(VK["SPACE"]) or _async_down(VK["W"]) or _async_down(VK["UP"])
+        down = _async_down(VK["DOWN"]) or _async_down(VK["S"])
+        up = _async_down(VK["UP"])
+        jump = _async_down(VK["SPACE"]) or _async_down(VK["W"])
         run_b = _async_down(VK["SHIFT"])
+        if down:
+            return 10
+        if left and run_b and jump:
+            return 9
+        if left and run_b:
+            return 8
+        if left and jump:
+            return 7
         if left:
             return 6
         if right and run_b and jump:
@@ -77,6 +92,8 @@ if platform.system() == "Windows":
             return 1
         if jump:
             return 5
+        if up:
+            return 11
         return 0
 
 else:
@@ -100,11 +117,21 @@ else:
         k = pygame.key.get_pressed()
         left = k[pygame.K_LEFT] or k[pygame.K_a]
         right = k[pygame.K_RIGHT] or k[pygame.K_d]
-        jump = k[pygame.K_SPACE] or k[pygame.K_w] or k[pygame.K_UP]
+        down = k[pygame.K_DOWN] or k[pygame.K_s]
+        up = k[pygame.K_UP]
+        jump = k[pygame.K_SPACE] or k[pygame.K_w]
         run_b = k[pygame.K_LSHIFT] or k[pygame.K_RSHIFT]
         if k[pygame.K_q]:
             pygame.quit()
             sys.exit(0)
+        if down:
+            return 10
+        if left and run_b and jump:
+            return 9
+        if left and run_b:
+            return 8
+        if left and jump:
+            return 7
         if left:
             return 6
         if right and run_b and jump:
@@ -117,6 +144,8 @@ else:
             return 1
         if jump:
             return 5
+        if up:
+            return 11
         return 0
 
 
