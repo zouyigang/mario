@@ -153,6 +153,12 @@ def _render_panel(panel_h, info, action, reward, total_reward,
         y0 += line_h
 
     components = [
+        ("warp_fwd",       info.get("warp_fwd_bonus", 0.0)),
+        ("pipe_enter",     info.get("pipe_enter_bonus", 0.0)),
+        ("z2_block_hit",   info.get("zone2_block_hit_bonus", 0.0)),
+        ("z2_block_stand", info.get("zone2_block_stand_bonus", 0.0)),
+        ("warp_back_pen",  -float(info.get("warp_back_penalty", 0.0) or 0.0)
+                            if info.get("warp_back") else 0.0),
         ("y_layer",        info.get("y_layer_bonus_given", 0.0)),
         ("cell_bonus",     info.get("cell_bonus_step", 0.0)),
         ("frontier",       info.get("frontier_reward", 0.0)),
@@ -208,6 +214,12 @@ def _render_panel(panel_h, info, action, reward, total_reward,
     if info.get("dead_loop"):          flags.append("DEAD_LOOP")
     if info.get("flag_get"):           flags.append("FLAG_GET")
     if info.get("no_new_cell"):        flags.append("no_progress")
+    if info.get("warp_fwd"):           flags.append("WARP_FWD_NEW")
+    if info.get("warp_back"):          flags.append("WARP_BACK ({})".format(info.get("warp_back_tag", "?")))
+    if info.get("coord_wrap"):         flags.append("COORD_WRAP")
+    if info.get("zone2_block_hit"):    flags.append("Z2_BLOCK_HIT")
+    if info.get("zone2_block_stand"):  flags.append("Z2_BLOCK_STAND")
+    if info.get("pipe_enter_bonus"):   flags.append("PIPE_ENTER")
 
     if _room(y0):
         _put_line(img, "-- flags/events --", 12, y0, PANEL_DIM, 0.42, 1)
@@ -353,6 +365,24 @@ def _collect_event_lines(step_idx, info, reward):
         out.append("S{}: DEAD_LOOP".format(step_idx))
     if info.get("teleport_branch"):
         out.append("S{}: TELEPORT".format(step_idx))
+    if info.get("warp_fwd"):
+        out.append("S{}: WARP_FWD_NEW (+{:.0f})".format(
+            step_idx, float(info.get("warp_fwd_bonus", 0.0) or 0.0)))
+    if info.get("warp_back"):
+        out.append("S{}: WARP_BACK {} (-{:.0f})".format(
+            step_idx, info.get("warp_back_tag", "?"),
+            float(info.get("warp_back_penalty", 0.0) or 0.0)))
+    if info.get("coord_wrap"):
+        out.append("S{}: COORD_WRAP".format(step_idx))
+    if info.get("pipe_enter_bonus"):
+        out.append("S{}: PIPE_ENTER (+{:.0f})".format(
+            step_idx, float(info.get("pipe_enter_bonus", 0.0) or 0.0)))
+    if info.get("zone2_block_hit"):
+        out.append("S{}: Z2_BLOCK_HIT (+{:.0f})".format(
+            step_idx, float(info.get("zone2_block_hit_bonus", 0.0) or 0.0)))
+    if info.get("zone2_block_stand"):
+        out.append("S{}: Z2_BLOCK_STAND (+{:.0f})".format(
+            step_idx, float(info.get("zone2_block_stand_bonus", 0.0) or 0.0)))
     if info.get("backtrack_success"):
         out.append("S{}: BACKTRACK_SUCC (+{:.1f})".format(
             step_idx, float(info.get("backtrack_success_bonus", 0.0) or 0.0)))
@@ -363,6 +393,44 @@ def _collect_event_lines(step_idx, info, reward):
         out.append("S{}: DEATH (-{:.1f})".format(
             step_idx, float(info.get("death_penalty_applied", 0.0) or 0.0)))
     return out
+
+
+def _format_episode_exit(info):
+    """生成与 EpisodeLogCallback 一致的局结束原因字符串，附本局事件计数。"""
+    # ---- 主标签 ----
+    if info.get("flag_get"):
+        suffix = "[到达终点]"
+    elif info.get("warp_back"):
+        tag = info.get("warp_back_tag", "WARP_BACK")
+        pen = float(info.get("warp_back_penalty", 10) or 10)
+        if tag == "WRONG_LOOP_TIMEOUT":
+            label = "老路超时终止"
+        elif tag == "BIG_JUMP":
+            label = "异常跳变终止"
+        else:
+            label = "管道回传终止"
+        suffix = "[{} {} -{:.0f}]".format(label, tag, pen)
+    elif info.get("dead_loop"):
+        suffix = "[循环超时]"
+    else:
+        suffix = "[死亡/其他]"
+
+    # ---- 本局事件计数（仅 WarpEventWrapper 在终止帧写入）----
+    extras = []
+    warp_fwd_n = int(info.get("episode_warp_fwd_count", 0) or 0)
+    coord_n    = int(info.get("episode_coord_wrap_count", 0) or 0)
+    wrong_n    = int(info.get("episode_wrong_loop_count", 0) or 0)
+    max_x      = int(info.get("episode_max_x_ever", 0) or 0)
+    if warp_fwd_n:
+        extras.append("[前传x{}]".format(warp_fwd_n))
+    if coord_n:
+        extras.append("[coord_wrap x{}]".format(coord_n))
+    if wrong_n:
+        extras.append("[wrong_loop x{}]".format(wrong_n))
+    if max_x:
+        extras.append("[max_x={}]".format(max_x))
+
+    return "{}  {}".format(suffix, "  ".join(extras)) if extras else suffix
 
 
 # ======================
@@ -463,9 +531,13 @@ def main():
                 cursor = len(buffer) - 1
                 done = bool(dones[0])
                 if info.get("flag_get"):
-                    print("EP {} 通关  step={}  total={:.1f}".format(episode, step_idx, total_reward))
+                    exit_str = _format_episode_exit(info)
+                    print("EP {} 通关  step={}  total={:.1f}  {}".format(
+                        episode, step_idx, total_reward, exit_str))
                 elif done:
-                    print("EP {} 结束  step={}  total={:.1f}".format(episode, step_idx, total_reward))
+                    exit_str = _format_episode_exit(info)
+                    print("EP {} 结束  step={}  total={:.1f}  {}".format(
+                        episode, step_idx, total_reward, exit_str))
 
             # 渲染当前 cursor 指向的帧
             frame = buffer[cursor]
