@@ -135,7 +135,7 @@ FRAME_SIZE = 84
 FRAME_STACK = 4
 
 # 奖励：与 train_sb3.py 完全一致
-DEATH_PENALTY_SEEN = 25      # 与 train_sb3.py 保持一致
+DEATH_PENALTY_SEEN = 40      # 死亡惩罚。提高后让 AI 更珍惜生命，减少主动自杀
 FLAG_GET_BONUS = 50
 
 # 死循环检测
@@ -199,11 +199,11 @@ ZONE2_STOMP_ONLY_DELTAS = (100, 400, 500, 800, 2000, 4000, 8000)
 # 问题：原设计只有事件 2/3 的奖励，AI 纯随机探索几乎不可能在正确 x 位置起跳顶到隐藏格
 # 解法：添加事件 1 的中间奖励，引导 AI 学会在 zone2 跳跃
 ZONE2_JUMP_BONUS = 2                # 在 zone2 起跳时奖励（检测 dy 从 >=0 变为 <0）
-ZONE2_PRESENCE_BONUS = 0.3          # 在 zone2 时每步给一点奖励，抵消 step_penalty 鼓励探索
-# zone2 重点区域额外奖励：在隐藏方格/飞乌龟集中的 x 范围给额外奖励，鼓励停留探索
-ZONE2_HOT_X_MIN = 2300
-ZONE2_HOT_X_MAX = 2480
-ZONE2_HOT_ZONE_BONUS = 0.5          # 在 hot zone 每步额外 +0.5
+ZONE2_PRESENCE_BONUS = 0.6          # 在 zone2 时每步给奖励，净赚 +0.2/步 鼓励探索
+# zone2 重点区域额外奖励：收缩到隐藏格附近 x=2400，鼓励集中探索
+ZONE2_HOT_X_MIN = 2380
+ZONE2_HOT_X_MAX = 2420
+ZONE2_HOT_ZONE_BONUS = 1.0          # 在 hot zone 每步额外 +1.0，净赚 +1.2/步
 # zone2 隐藏方格位置（x坐标判断）
 ZONE2_BLOCK_HIT_X = 2400            # 隐藏方格的 x 坐标
 ZONE2_BLOCK_HIT_X_TOL = 10          # 允许的 x 容差（±10像素）
@@ -219,7 +219,7 @@ ADDITIONAL_TIMESTEPS = 8_000_000
 # 接着训的 PPO 超参（比从头训稍保守）
 ENT_COEF_CONTINUE = 0.03  # 提高初始熵系数，让模型更频繁随机尝试 DOWN 等非主流动作
 # 自适应熵回调里 ent_coef 的上限；7 动作空间 0.2 会把 logits 抹平导致策略崩塌
-ENT_COEF_MAX = 0.05
+ENT_COEF_MAX = 0.12
 LR_CONTINUE = 3e-5
 LR_CONTINUE_END = 1e-5
 USE_LR_DECAY_CONTINUE = True

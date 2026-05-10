@@ -136,7 +136,7 @@ TOTAL_TIMESTEPS = 20_000_000
 
 # 奖励设计：正常步 = clip(底层 Δx, -3, +3) / 死亡(-15) / 通关(+50 + 速度)
 # 不能用 np.sign：会把"覆盖距离"扭成"出现正 Δx 的步数"，慢速高跳每个滞空帧都拿满 +1 → 刷分
-DEATH_PENALTY_SEEN = 25      # 死亡惩罚。15 = 只需前进 15 步就能回本，冒险跨坑是划算的
+DEATH_PENALTY_SEEN = 40      # 死亡惩罚。提高后让 AI 更珍惜生命，减少主动自杀
 FLAG_GET_BONUS = 50           # 通关额外奖励，远大于死亡惩罚，鼓励冲终点
 
 # 死循环检测
@@ -200,11 +200,11 @@ ZONE2_STOMP_ONLY_DELTAS = (100, 400, 500, 800, 2000, 4000, 8000)
 # 问题：原设计只有事件 2/3 的奖励，AI 纯随机探索几乎不可能在正确 x 位置起跳顶到隐藏格
 # 解法：添加事件 1 的中间奖励，引导 AI 学会在 zone2 跳跃
 ZONE2_JUMP_BONUS = 2                # 在 zone2 起跳时奖励（检测 dy 从 >=0 变为 <0）
-ZONE2_PRESENCE_BONUS = 0.3          # 在 zone2 时每步给一点奖励，抵消 step_penalty 鼓励探索
-# zone2 重点区域额外奖励：在隐藏方格/飞乌龟集中的 x 范围给额外奖励，鼓励停留探索
-ZONE2_HOT_X_MIN = 2300
-ZONE2_HOT_X_MAX = 2480
-ZONE2_HOT_ZONE_BONUS = 0.5          # 在 hot zone 每步额外 +0.5
+ZONE2_PRESENCE_BONUS = 0.6          # 在 zone2 时每步给奖励，净赚 +0.2/步 鼓励探索
+# zone2 重点区域额外奖励：收缩到隐藏格附近 x=2400，鼓励集中探索
+ZONE2_HOT_X_MIN = 2380
+ZONE2_HOT_X_MAX = 2420
+ZONE2_HOT_ZONE_BONUS = 1.0          # 在 hot zone 每步额外 +1.0，净赚 +1.2/步
 # zone2 隐藏方格位置（x坐标判断）
 ZONE2_BLOCK_HIT_X = 2400            # 隐藏方格的 x 坐标
 ZONE2_BLOCK_HIT_X_TOL = 10          # 允许的 x 容差（±10像素）
