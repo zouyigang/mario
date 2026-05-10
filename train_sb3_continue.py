@@ -1,4 +1,4 @@
-﻿# ======================
+# ======================
 # 马里奥强化学习训练脚本（接着训练）
 # ======================
 # 用途：加载已有 best/checkpoint 在此基础上继续训练（可换关卡）。
@@ -135,7 +135,7 @@ FRAME_SIZE = 84
 FRAME_STACK = 4
 
 # 奖励：与 train_sb3.py 完全一致
-DEATH_PENALTY_SEEN = 15
+DEATH_PENALTY_SEEN = 25      # 与 train_sb3.py 保持一致
 FLAG_GET_BONUS = 50
 
 # 死循环检测
@@ -176,22 +176,41 @@ COORD_WRAP_GRACE_STEPS = 120
 #   1) 顶出方格：score 增加 + Mario 正在向上 (dy_pixel<0)，几乎只有顶到 ?/隐藏/砖块时才同时满足
 #   2) 跳上方格：顶击之后窗口期内，Mario 在比顶击点更高的 y_pixel 处稳定下来（|dy|≤1 连续若干帧）
 # 这样存量台阶/平台不会触发奖励，奖励池只属于真正与新方块互动的局
-ZONE2_BLOCK_HIT_BONUS = 30           # 顶到一个加分方块（隐藏块/?块/砖块）
-ZONE2_BLOCK_STAND_BONUS = 30         # 跳到刚顶出的方块上方稳定站立
+ZONE2_BLOCK_HIT_BONUS = 80           # 顶到一个加分方块（隐藏块/?块/砖块）
+ZONE2_BLOCK_STAND_BONUS = 80         # 跳到刚顶出的方块上方稳定站立
 ZONE2_BLOCK_STAND_WINDOW = 60        # 顶击后多少 wrapper 步内允许触发"站上"奖励
 ZONE2_BLOCK_STAND_X_TOL = 32         # 稳定位置离顶击点 x 容差（约 2 tile）
 ZONE2_STAND_STABLE_FRAMES = 2        # 连续 |dy|≤1 多少 wrapper 步算"站稳"
 # 高度门限：只有 y_pixel < 此值时才认作"顶到上方方块"
 # 原因：地面栗子 y_pixel ≈ 190，Mario 接触它时自身 y_pixel ≈ 150-160，全部高于此阈值；
 # 连击踩栗子时 Mario 在空中漂浮也基本在 y_pixel ≥ 145；
-# 真正的隐藏方格在 8-4 zone2 较高位置，Mario 必须跳到 y_pixel ≤ 130 左右才能顶到。
-# 设 135 为安全阈值，不会误伤真隐藏块，但能完全过滤地面踩怪场景。
-ZONE2_BLOCK_HIT_MAX_Y = 135
+# 实测：8-4 zone2 隐藏格在 y_pixel≈142 时仍可顶到（score+200），需留足余量。
+# 设 155 为安全阈值：允许真实隐藏块（y≤145 左右），同时过滤大部分地面踩怪场景（y≥160）。
+ZONE2_BLOCK_HIT_MAX_Y = 155
 # Stomp-chain 专属 score 值：连击第 3、5、7、8、9+ 击分别给 400/800/2000/4000/8000；
 # 任何顶方块场景都不会出这些数（砖块=50，金币=100，?块=200，道具=1000）。
 # 在高空连击 paratroopa 时即使 y<135 也会被这些值挡掉。
-# 100/200/1000 仍允许（顶?块可能给 100/200，power-up 给 1000）。
-ZONE2_STOMP_ONLY_DELTAS = (400, 500, 800, 2000, 4000, 8000)
+# 排除 100（金币/coin）：zone2 空中跳跃碰到金币也会 +100，会被误判为"顶方块"
+#   保留 50(砖块), 200(?块), 1000(道具/蘑菇/花) 作为合法的顶方块 score 值
+ZONE2_STOMP_ONLY_DELTAS = (100, 400, 500, 800, 2000, 4000, 8000)
+
+# zone2 渐进式探索奖励：把"顶出隐藏格"这个极低概率事件分解为可学习的阶梯
+#   1) 在 zone2 起跳 → 2) 顶到隐藏格 → 3) 站上方格
+# 问题：原设计只有事件 2/3 的奖励，AI 纯随机探索几乎不可能在正确 x 位置起跳顶到隐藏格
+# 解法：添加事件 1 的中间奖励，引导 AI 学会在 zone2 跳跃
+ZONE2_JUMP_BONUS = 2                # 在 zone2 起跳时奖励（检测 dy 从 >=0 变为 <0）
+ZONE2_PRESENCE_BONUS = 0.3          # 在 zone2 时每步给一点奖励，抵消 step_penalty 鼓励探索
+# zone2 重点区域额外奖励：在隐藏方格/飞乌龟集中的 x 范围给额外奖励，鼓励停留探索
+ZONE2_HOT_X_MIN = 2300
+ZONE2_HOT_X_MAX = 2480
+ZONE2_HOT_ZONE_BONUS = 0.5          # 在 hot zone 每步额外 +0.5
+# zone2 隐藏方格位置（x坐标判断）
+ZONE2_BLOCK_HIT_X = 2400            # 隐藏方格的 x 坐标
+ZONE2_BLOCK_HIT_X_TOL = 10          # 允许的 x 容差（±10像素）
+ZONE2_BLOCK_HIT_Y_THRESHOLD = 145   # 触发顶格的 y 阈值
+# zone2 x 超限截断：zone2 激活后，若 Mario 的 x_world 超过此阈值，
+# 说明已走过隐藏格/水管区域进入重复路段，立即终止本局按死亡处理防止刷分
+ZONE2_X_MAX = 2500
 
 # 加载模型
 LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
@@ -457,7 +476,16 @@ class WarpEventWrapper(Wrapper):
                  zone2_block_stand_x_tol=ZONE2_BLOCK_STAND_X_TOL,
                  zone2_stand_stable_frames=ZONE2_STAND_STABLE_FRAMES,
                  zone2_block_hit_max_y=ZONE2_BLOCK_HIT_MAX_Y,
-                 zone2_stomp_only_deltas=ZONE2_STOMP_ONLY_DELTAS):
+                 zone2_stomp_only_deltas=ZONE2_STOMP_ONLY_DELTAS,
+                 zone2_jump_bonus=ZONE2_JUMP_BONUS,
+                 zone2_presence_bonus=ZONE2_PRESENCE_BONUS,
+                 zone2_hot_x_min=ZONE2_HOT_X_MIN,
+                 zone2_hot_x_max=ZONE2_HOT_X_MAX,
+                 zone2_hot_zone_bonus=ZONE2_HOT_ZONE_BONUS,
+                 zone2_block_hit_x=ZONE2_BLOCK_HIT_X,
+                 zone2_block_hit_x_tol=ZONE2_BLOCK_HIT_X_TOL,
+                 zone2_block_hit_y_threshold=ZONE2_BLOCK_HIT_Y_THRESHOLD,
+                 zone2_x_max=ZONE2_X_MAX):
         super().__init__(env)
         self._warp_back_penalty = float(warp_back_penalty)
         self._warp_fwd_bonus = float(warp_fwd_bonus)
@@ -470,6 +498,15 @@ class WarpEventWrapper(Wrapper):
         self._zone2_stand_stable_frames = int(zone2_stand_stable_frames)
         self._zone2_block_hit_max_y = int(zone2_block_hit_max_y)
         self._zone2_stomp_only_deltas = frozenset(int(v) for v in zone2_stomp_only_deltas)
+        self._zone2_jump_bonus = float(zone2_jump_bonus)
+        self._zone2_presence_bonus = float(zone2_presence_bonus)
+        self._zone2_hot_x_min = int(zone2_hot_x_min)
+        self._zone2_hot_x_max = int(zone2_hot_x_max)
+        self._zone2_hot_zone_bonus = float(zone2_hot_zone_bonus)
+        self._zone2_block_hit_x = int(zone2_block_hit_x)
+        self._zone2_block_hit_x_tol = int(zone2_block_hit_x_tol)
+        self._zone2_block_hit_y_threshold = int(zone2_block_hit_y_threshold)
+        self._zone2_x_max = int(zone2_x_max)
         self._prev_snap = None
         self._max_x_ever = 0
         self._warp_fwd_count = 0
@@ -479,6 +516,7 @@ class WarpEventWrapper(Wrapper):
         # zone2：第一次 WARP_FWD_NEW 后激活
         self._zone2_active = False
         self._zone2_block_hit_count = 0
+        self._zone2_block_hit_triggered = False
         self._zone2_block_stand_count = 0
         # 顶击事件登记：剩余允许触发"站上"的步数 + 顶击时的 (x,y)，等待匹配站稳事件
         self._zone2_pending_stand_steps = 0
@@ -487,6 +525,8 @@ class WarpEventWrapper(Wrapper):
         self._zone2_stable_frames = 0
         # 上一步的 dy（y_now - y_prev）：用于顶击判定要求"连续两步都在上升"，过滤踩怪反弹
         self._last_dy = 0
+        # zone2 跳跃追踪：检测起跳（dy 从 >=0 变为 <0）
+        self._zone2_in_jump = False
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -498,12 +538,14 @@ class WarpEventWrapper(Wrapper):
         self._post_wrap_steps_left = 0
         self._zone2_active = False
         self._zone2_block_hit_count = 0
+        self._zone2_block_hit_triggered = False
         self._zone2_block_stand_count = 0
         self._zone2_pending_stand_steps = 0
         self._zone2_pending_hit_x = 0
         self._zone2_pending_hit_y = 0
         self._zone2_stable_frames = 0
         self._last_dy = 0
+        self._zone2_in_jump = False
         return obs, info
 
     def step(self, action):
@@ -556,8 +598,11 @@ class WarpEventWrapper(Wrapper):
             info["warp_fwd_bonus"] = self._warp_fwd_bonus
             self._warp_fwd_count += 1
             # 第一次前传成功 → 激活 zone2 高位探索奖励
+            # 再次前传成功（从 zone2 出来）→ 关闭 zone2
             if not self._zone2_active:
                 self._zone2_active = True
+            else:
+                self._zone2_active = False
         elif tag in ("WARP_BACK_REVISIT", "WARP_BACK_NEW", "BIG_JUMP", "WRONG_LOOP_TIMEOUT"):
             reward -= self._warp_back_penalty
             info["warp_back"] = True
@@ -572,7 +617,10 @@ class WarpEventWrapper(Wrapper):
         # NORMAL / WARP_FWD_REVISIT / INIT: 不改奖励
 
         # ---- zone2 方块互动奖励 ----
-        # 第一次 WARP_FWD_NEW 后激活，只奖励两个具体事件：
+        # 第一次 WARP_FWD_NEW 后激活，奖励四个渐进事件：
+        #   事件 0a（zone2 存在奖励）：在 zone2 时每步给小奖励，抵消 step_penalty 鼓励探索
+        #   事件 0b（zone2 起跳奖励）：检测 dy 从 >=0 变为 <0，鼓励跳跃行为
+        #   事件 0c（zone2 高跳奖励）：跳跃中首次到达 y_pixel < 阈值，鼓励跳得够高
         #   事件 1（顶出方格）：4 重过滤
         #     (a) score_delta > 0 且不在 STOMP_ONLY_DELTAS（400/800/2000... 是连击专属，方块给不出）
         #     (b) dy_pixel < 0（当前正在向上）
@@ -596,13 +644,41 @@ class WarpEventWrapper(Wrapper):
             prev_dy = self._last_dy
             x_now = snap.get("x_world", 0)
 
-            # 事件 1：顶出方格（4 重过滤：score 值 + 连续两帧上升 + 高度足够低）
-            if (score_delta > 0
-                    and score_delta not in self._zone2_stomp_only_deltas
-                    and dy < 0 and prev_dy < 0
-                    and y_now < self._zone2_block_hit_max_y):
+            # 事件 0a：zone2 存在奖励（每步 +0.3，抵消 step_penalty 鼓励在 zone2 探索）
+            if self._zone2_presence_bonus > 0:
+                reward += self._zone2_presence_bonus
+                info["zone2_presence_bonus"] = self._zone2_presence_bonus
+            
+            # 事件 0d：zone2 hot zone 额外奖励（隐藏方格/飞乌龟区域）
+            if (self._zone2_hot_zone_bonus > 0
+                    and self._zone2_hot_x_min <= x_now <= self._zone2_hot_x_max):
+                reward += self._zone2_hot_zone_bonus
+                info["zone2_hot_zone"] = True
+                info["zone2_hot_zone_bonus"] = self._zone2_hot_zone_bonus
+
+            # 事件 0b：zone2 起跳奖励（检测 dy 从 >=0 变为 <0，每次起跳 +2）
+            if dy < 0 and prev_dy >= 0:
+                self._zone2_in_jump = True
+                if self._zone2_jump_bonus > 0:
+                    reward += self._zone2_jump_bonus
+                    info["zone2_jump"] = True
+                    info["zone2_jump_bonus"] = self._zone2_jump_bonus
+
+            # 检测落地：dy 从 <0 变为 >=0，结束跳跃弧
+            if dy >= 0 and prev_dy < 0:
+                self._zone2_in_jump = False
+
+            # 事件 1：顶出方格（x,y + score双重验证）
+            if (self._zone2_active
+                    and not self._zone2_block_hit_triggered
+                    and abs(x_now - self._zone2_block_hit_x) <= self._zone2_block_hit_x_tol
+                    and y_now < self._zone2_block_hit_y_threshold
+                    and dy < 0
+                    and score_delta > 0
+                    and score_delta not in self._zone2_stomp_only_deltas):
                 reward += self._zone2_block_hit_bonus
                 self._zone2_block_hit_count += 1
+                self._zone2_block_hit_triggered = True
                 info["zone2_block_hit"] = True
                 info["zone2_block_hit_bonus"] = self._zone2_block_hit_bonus
                 # 登记一个"等待站上"事件，限定时间窗口与位置
@@ -630,6 +706,18 @@ class WarpEventWrapper(Wrapper):
 
             # 记录本帧 dy 给下一步用（顶击判定需要 prev_dy<0）
             self._last_dy = dy
+
+        # ---- zone2 x 超限截断：防止走过隐藏格/水管区域后继续刷分 ----
+        # 只要在 zone2 中且 x 超过阈值就截断
+        if (self._zone2_active
+                and self._zone2_x_max > 0
+                and snap is not None
+                and snap.get("x_world", 0) > self._zone2_x_max):
+            reward -= DEATH_PENALTY_SEEN
+            info["warp_back"] = True
+            info["warp_back_tag"] = "ZONE2_X_MAX"
+            info["warp_back_penalty"] = DEATH_PENALTY_SEEN
+            truncated = True
 
         if snap is not None:
             self._max_x_ever = max(self._max_x_ever, snap.get("x_world", 0))
@@ -688,6 +776,15 @@ def make_env(env_id=None):
         zone2_stand_stable_frames=ZONE2_STAND_STABLE_FRAMES,
         zone2_block_hit_max_y=ZONE2_BLOCK_HIT_MAX_Y,
         zone2_stomp_only_deltas=ZONE2_STOMP_ONLY_DELTAS,
+        zone2_jump_bonus=ZONE2_JUMP_BONUS,
+        zone2_presence_bonus=ZONE2_PRESENCE_BONUS,
+        zone2_hot_x_min=ZONE2_HOT_X_MIN,
+        zone2_hot_x_max=ZONE2_HOT_X_MAX,
+        zone2_hot_zone_bonus=ZONE2_HOT_ZONE_BONUS,
+        zone2_block_hit_x=ZONE2_BLOCK_HIT_X,
+        zone2_block_hit_x_tol=ZONE2_BLOCK_HIT_X_TOL,
+        zone2_block_hit_y_threshold=ZONE2_BLOCK_HIT_Y_THRESHOLD,
+        zone2_x_max=ZONE2_X_MAX,
     )
     env = Monitor(env)
     return env

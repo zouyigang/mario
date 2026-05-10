@@ -157,6 +157,10 @@ def _render_panel(panel_h, info, action, reward, total_reward,
         ("pipe_enter",     info.get("pipe_enter_bonus", 0.0)),
         ("z2_block_hit",   info.get("zone2_block_hit_bonus", 0.0)),
         ("z2_block_stand", info.get("zone2_block_stand_bonus", 0.0)),
+        ("z2_jump",        info.get("zone2_jump_bonus", 0.0)),
+        ("z2_high_reach",  info.get("zone2_high_reach_bonus", 0.0)),
+        ("z2_presence",    info.get("zone2_presence_bonus", 0.0)),
+        ("z2_hot_zone",    info.get("zone2_hot_zone_bonus", 0.0)),
         ("warp_back_pen",  -float(info.get("warp_back_penalty", 0.0) or 0.0)
                             if info.get("warp_back") else 0.0),
         ("y_layer",        info.get("y_layer_bonus_given", 0.0)),
@@ -219,6 +223,9 @@ def _render_panel(panel_h, info, action, reward, total_reward,
     if info.get("coord_wrap"):         flags.append("COORD_WRAP")
     if info.get("zone2_block_hit"):    flags.append("Z2_BLOCK_HIT")
     if info.get("zone2_block_stand"):  flags.append("Z2_BLOCK_STAND")
+    if info.get("zone2_jump"):         flags.append("Z2_JUMP")
+    if info.get("zone2_high_reach"):   flags.append("Z2_HIGH_REACH")
+    if info.get("zone2_hot_zone"):     flags.append("Z2_HOT_ZONE")
     if info.get("pipe_enter_bonus"):   flags.append("PIPE_ENTER")
 
     if _room(y0):
@@ -383,6 +390,12 @@ def _collect_event_lines(step_idx, info, reward):
     if info.get("zone2_block_stand"):
         out.append("S{}: Z2_BLOCK_STAND (+{:.0f})".format(
             step_idx, float(info.get("zone2_block_stand_bonus", 0.0) or 0.0)))
+    if info.get("zone2_jump"):
+        out.append("S{}: Z2_JUMP (+{:.0f})".format(
+            step_idx, float(info.get("zone2_jump_bonus", 0.0) or 0.0)))
+    if info.get("zone2_high_reach"):
+        out.append("S{}: Z2_HIGH_REACH (+{:.0f})".format(
+            step_idx, float(info.get("zone2_high_reach_bonus", 0.0) or 0.0)))
     if info.get("backtrack_success"):
         out.append("S{}: BACKTRACK_SUCC (+{:.1f})".format(
             step_idx, float(info.get("backtrack_success_bonus", 0.0) or 0.0)))

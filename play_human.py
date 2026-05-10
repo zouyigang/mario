@@ -374,6 +374,9 @@ def _info_flag_lines(info):
     if info.get("warp_back"):             lines.append("WARP_BACK ({})".format(info.get("warp_back_tag", "?")))
     if info.get("zone2_block_hit"):       lines.append("Z2_BLOCK_HIT")
     if info.get("zone2_block_stand"):     lines.append("Z2_BLOCK_STAND")
+    if info.get("zone2_jump"):            lines.append("Z2_JUMP")
+    if info.get("zone2_high_reach"):      lines.append("Z2_HIGH_REACH")
+    if info.get("zone2_hot_zone"):        lines.append("Z2_HOT_ZONE")
     if info.get("pipe_enter_bonus"):      lines.append("PIPE_ENTER")
     return lines
 
@@ -568,6 +571,10 @@ def _draw_diag_panel(snap, prev_snap, info, step_idx, action,
         ("pipe_enter",     _info.get("pipe_enter_bonus", 0.0)),
         ("z2_block_hit",   _info.get("zone2_block_hit_bonus", 0.0)),
         ("z2_block_stand", _info.get("zone2_block_stand_bonus", 0.0)),
+        ("z2_jump",        _info.get("zone2_jump_bonus", 0.0)),
+        ("z2_high_reach",  _info.get("zone2_high_reach_bonus", 0.0)),
+        ("z2_presence",    _info.get("zone2_presence_bonus", 0.0)),
+        ("z2_hot_zone",    _info.get("zone2_hot_zone_bonus", 0.0)),
         ("warp_back_pen",  -float(_info.get("warp_back_penalty", 0.0) or 0.0)
                             if _info.get("warp_back") else 0.0),
     ]
