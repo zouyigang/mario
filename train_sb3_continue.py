@@ -211,6 +211,15 @@ ZONE2_BLOCK_HIT_Y_THRESHOLD = 145   # 触发顶格的 y 阈值
 # zone2 x 超限截断：zone2 激活后，若 Mario 的 x_world 超过此阈值，
 # 说明已走过隐藏格/水管区域进入重复路段，立即终止本局按死亡处理防止刷分
 ZONE2_X_MAX = 2500
+# zone2 站上隐藏格后 → 管道冲刺阶段
+# 站上格子后 hot zone 延伸到水管右侧，跳跃奖励翻倍，引导 AI 往右上方跳上水管
+ZONE2_POST_STAND_HOT_X_MAX = 2520    # 站上格子后 hot zone 右界
+ZONE2_POST_STAND_JUMP_BONUS = 5      # 站上格子后跳跃奖励翻倍
+ZONE2_POST_STAND_JUMP_Y_MAX = 160   # 高位跳跃才给翻倍奖励，掉地上变回 +2 防止刷分
+ZONE2_POST_STAND_PIPE_X = 2460       # 水管上方 x 坐标
+ZONE2_POST_STAND_PIPE_X_TOL = 15     # 水管上方 x 容差
+ZONE2_POST_STAND_PIPE_Y_MAX = 110    # 水管上方 y 阈值（水管比隐藏格高很多）
+ZONE2_POST_STAND_PIPE_BONUS = 80     # 跳上水管一次性奖励
 
 # 加载模型
 LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
@@ -485,7 +494,14 @@ class WarpEventWrapper(Wrapper):
                  zone2_block_hit_x=ZONE2_BLOCK_HIT_X,
                  zone2_block_hit_x_tol=ZONE2_BLOCK_HIT_X_TOL,
                  zone2_block_hit_y_threshold=ZONE2_BLOCK_HIT_Y_THRESHOLD,
-                 zone2_x_max=ZONE2_X_MAX):
+                 zone2_x_max=ZONE2_X_MAX,
+                 zone2_post_stand_hot_x_max=ZONE2_POST_STAND_HOT_X_MAX,
+                 zone2_post_stand_jump_bonus=ZONE2_POST_STAND_JUMP_BONUS,
+                 zone2_post_stand_jump_y_max=ZONE2_POST_STAND_JUMP_Y_MAX,
+                 zone2_post_stand_pipe_x=ZONE2_POST_STAND_PIPE_X,
+                 zone2_post_stand_pipe_x_tol=ZONE2_POST_STAND_PIPE_X_TOL,
+                 zone2_post_stand_pipe_y_max=ZONE2_POST_STAND_PIPE_Y_MAX,
+                 zone2_post_stand_pipe_bonus=ZONE2_POST_STAND_PIPE_BONUS):
         super().__init__(env)
         self._warp_back_penalty = float(warp_back_penalty)
         self._warp_fwd_bonus = float(warp_fwd_bonus)
@@ -507,6 +523,13 @@ class WarpEventWrapper(Wrapper):
         self._zone2_block_hit_x_tol = int(zone2_block_hit_x_tol)
         self._zone2_block_hit_y_threshold = int(zone2_block_hit_y_threshold)
         self._zone2_x_max = int(zone2_x_max)
+        self._zone2_post_stand_hot_x_max = int(zone2_post_stand_hot_x_max)
+        self._zone2_post_stand_jump_bonus = float(zone2_post_stand_jump_bonus)
+        self._zone2_post_stand_jump_y_max = int(zone2_post_stand_jump_y_max)
+        self._zone2_post_stand_pipe_x = int(zone2_post_stand_pipe_x)
+        self._zone2_post_stand_pipe_x_tol = int(zone2_post_stand_pipe_x_tol)
+        self._zone2_post_stand_pipe_y_max = int(zone2_post_stand_pipe_y_max)
+        self._zone2_post_stand_pipe_bonus = float(zone2_post_stand_pipe_bonus)
         self._prev_snap = None
         self._max_x_ever = 0
         self._warp_fwd_count = 0
@@ -527,6 +550,9 @@ class WarpEventWrapper(Wrapper):
         self._last_dy = 0
         # zone2 跳跃追踪：检测起跳（dy 从 >=0 变为 <0）
         self._zone2_in_jump = False
+        # zone2 post-stand：站上隐藏格后激活，引导 AI 往右上方水管跳
+        self._zone2_post_stand = False
+        self._zone2_post_stand_pipe_triggered = False
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -546,6 +572,8 @@ class WarpEventWrapper(Wrapper):
         self._zone2_stable_frames = 0
         self._last_dy = 0
         self._zone2_in_jump = False
+        self._zone2_post_stand = False
+        self._zone2_post_stand_pipe_triggered = False
         return obs, info
 
     def step(self, action):
@@ -645,24 +673,30 @@ class WarpEventWrapper(Wrapper):
             x_now = snap.get("x_world", 0)
 
             # 事件 0a：zone2 存在奖励（每步 +0.3，抵消 step_penalty 鼓励在 zone2 探索）
-            if self._zone2_presence_bonus > 0:
+            # 站上格子后取消：防止马里奥落地后原地刷 presence 分
+            if self._zone2_presence_bonus > 0 and not self._zone2_post_stand:
                 reward += self._zone2_presence_bonus
                 info["zone2_presence_bonus"] = self._zone2_presence_bonus
-            
-            # 事件 0d：zone2 hot zone 额外奖励（隐藏方格/飞乌龟区域）
+
+            # 事件 0d：zone2 hot zone 额外奖励（隐藏方格/水管区域）
+            # 站上格子后取消：防止马里奥在 hot zone 原地刷分
+            hot_x_max = self._zone2_post_stand_hot_x_max if self._zone2_post_stand else self._zone2_hot_x_max
             if (self._zone2_hot_zone_bonus > 0
-                    and self._zone2_hot_x_min <= x_now <= self._zone2_hot_x_max):
+                    and not self._zone2_post_stand
+                    and self._zone2_hot_x_min <= x_now <= hot_x_max):
                 reward += self._zone2_hot_zone_bonus
                 info["zone2_hot_zone"] = True
                 info["zone2_hot_zone_bonus"] = self._zone2_hot_zone_bonus
 
-            # 事件 0b：zone2 起跳奖励（检测 dy 从 >=0 变为 <0，每次起跳 +2）
+            # 事件 0b：zone2 起跳奖励（post-stand 后完全禁止，唯一目标是跳上水管）
             if dy < 0 and prev_dy >= 0:
                 self._zone2_in_jump = True
-                if self._zone2_jump_bonus > 0:
-                    reward += self._zone2_jump_bonus
-                    info["zone2_jump"] = True
-                    info["zone2_jump_bonus"] = self._zone2_jump_bonus
+                if not self._zone2_post_stand:
+                    jump_bonus = self._zone2_jump_bonus
+                    if jump_bonus > 0:
+                        reward += jump_bonus
+                        info["zone2_jump"] = True
+                        info["zone2_jump_bonus"] = jump_bonus
 
             # 检测落地：dy 从 <0 变为 >=0，结束跳跃弧
             if dy >= 0 and prev_dy < 0:
@@ -703,6 +737,19 @@ class WarpEventWrapper(Wrapper):
                     info["zone2_block_stand"] = True
                     info["zone2_block_stand_bonus"] = self._zone2_block_stand_bonus
                     self._zone2_pending_stand_steps = 0   # 一次顶击只奖励一次"站上"
+                    # 站上隐藏格后 → 激活管道冲刺阶段
+                    self._zone2_post_stand = True
+
+            # 事件 3：post-stand 阶段跳上水管（站稳 + 在管道 x/y 范围内）
+            if (self._zone2_post_stand
+                    and not self._zone2_post_stand_pipe_triggered
+                    and self._zone2_stable_frames >= self._zone2_stand_stable_frames
+                    and y_now < self._zone2_post_stand_pipe_y_max
+                    and abs(x_now - self._zone2_post_stand_pipe_x) <= self._zone2_post_stand_pipe_x_tol):
+                reward += self._zone2_post_stand_pipe_bonus
+                self._zone2_post_stand_pipe_triggered = True
+                info["zone2_post_stand_pipe"] = True
+                info["zone2_post_stand_pipe_bonus"] = self._zone2_post_stand_pipe_bonus
 
             # 记录本帧 dy 给下一步用（顶击判定需要 prev_dy<0）
             self._last_dy = dy
@@ -730,6 +777,7 @@ class WarpEventWrapper(Wrapper):
             info["episode_max_x_ever"] = self._max_x_ever
             info["episode_zone2_block_hits"] = self._zone2_block_hit_count
             info["episode_zone2_block_stands"] = self._zone2_block_stand_count
+            info["episode_zone2_post_stand_pipe"] = 1 if self._zone2_post_stand_pipe_triggered else 0
 
         return obs, reward, terminated, truncated, info
 
@@ -785,6 +833,13 @@ def make_env(env_id=None):
         zone2_block_hit_x_tol=ZONE2_BLOCK_HIT_X_TOL,
         zone2_block_hit_y_threshold=ZONE2_BLOCK_HIT_Y_THRESHOLD,
         zone2_x_max=ZONE2_X_MAX,
+        zone2_post_stand_hot_x_max=ZONE2_POST_STAND_HOT_X_MAX,
+        zone2_post_stand_jump_bonus=ZONE2_POST_STAND_JUMP_BONUS,
+        zone2_post_stand_jump_y_max=ZONE2_POST_STAND_JUMP_Y_MAX,
+        zone2_post_stand_pipe_x=ZONE2_POST_STAND_PIPE_X,
+        zone2_post_stand_pipe_x_tol=ZONE2_POST_STAND_PIPE_X_TOL,
+        zone2_post_stand_pipe_y_max=ZONE2_POST_STAND_PIPE_Y_MAX,
+        zone2_post_stand_pipe_bonus=ZONE2_POST_STAND_PIPE_BONUS,
     )
     env = Monitor(env)
     return env
@@ -992,6 +1047,9 @@ class EpisodeLogCallback(BaseCallback):
                 z2s = info.get("episode_zone2_block_stands")
                 if z2s:
                     extras.append("z2_stand x{}".format(int(z2s)))
+                z2p = info.get("episode_zone2_post_stand_pipe")
+                if z2p:
+                    extras.append("z2_pipe")
                 extras_s = ("  " + " ".join("[{}]".format(x) for x in extras)) if extras else ""
 
                 ec = getattr(self.model, "ent_coef", None)

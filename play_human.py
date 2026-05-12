@@ -377,6 +377,7 @@ def _info_flag_lines(info):
     if info.get("zone2_jump"):            lines.append("Z2_JUMP")
     if info.get("zone2_high_reach"):      lines.append("Z2_HIGH_REACH")
     if info.get("zone2_hot_zone"):        lines.append("Z2_HOT_ZONE")
+    if info.get("zone2_post_stand_pipe"): lines.append("Z2_POST_PIPE")
     if info.get("pipe_enter_bonus"):      lines.append("PIPE_ENTER")
     return lines
 
@@ -575,6 +576,7 @@ def _draw_diag_panel(snap, prev_snap, info, step_idx, action,
         ("z2_high_reach",  _info.get("zone2_high_reach_bonus", 0.0)),
         ("z2_presence",    _info.get("zone2_presence_bonus", 0.0)),
         ("z2_hot_zone",    _info.get("zone2_hot_zone_bonus", 0.0)),
+        ("z2_post_pipe",   _info.get("zone2_post_stand_pipe_bonus", 0.0)),
         ("warp_back_pen",  -float(_info.get("warp_back_penalty", 0.0) or 0.0)
                             if _info.get("warp_back") else 0.0),
     ]
