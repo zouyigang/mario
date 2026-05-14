@@ -215,11 +215,9 @@ ZONE2_X_MAX = 2500
 # zone2 站上隐藏格后 → 管道冲刺阶段
 # 站上格子后 hot zone 延伸到水管右侧，跳跃奖励翻倍，引导 AI 往右上方跳上水管
 ZONE2_POST_STAND_HOT_X_MAX = 2520    # 站上格子后 hot zone 右界
-ZONE2_POST_STAND_JUMP_BONUS = 5      # 站上格子后跳跃奖励翻倍
-ZONE2_POST_STAND_JUMP_Y_MAX = 160   # 高位跳跃才给翻倍奖励，掉地上变回 +2 防止刷分
-ZONE2_POST_STAND_PIPE_X = 2460       # 水管上方 x 坐标
-ZONE2_POST_STAND_PIPE_X_TOL = 15     # 水管上方 x 容差
-ZONE2_POST_STAND_PIPE_Y_MAX = 110    # 水管上方 y 阈值（水管比隐藏格高很多）
+ZONE2_POST_STAND_PIPE_X = 2445       # 水管上方 x 坐标
+ZONE2_POST_STAND_PIPE_X_TOL = 5     # 水管上方 x 容差
+ZONE2_POST_STAND_PIPE_Y_MAX = 65    # 水管上方 y 阈值（水管比隐藏格高很多）
 ZONE2_POST_STAND_PIPE_BONUS = 80     # 跳上水管一次性奖励
 
 # PPO 超参
@@ -495,8 +493,6 @@ class WarpEventWrapper(Wrapper):
                  zone2_block_hit_y_threshold=ZONE2_BLOCK_HIT_Y_THRESHOLD,
                  zone2_x_max=ZONE2_X_MAX,
                  zone2_post_stand_hot_x_max=ZONE2_POST_STAND_HOT_X_MAX,
-                 zone2_post_stand_jump_bonus=ZONE2_POST_STAND_JUMP_BONUS,
-                 zone2_post_stand_jump_y_max=ZONE2_POST_STAND_JUMP_Y_MAX,
                  zone2_post_stand_pipe_x=ZONE2_POST_STAND_PIPE_X,
                  zone2_post_stand_pipe_x_tol=ZONE2_POST_STAND_PIPE_X_TOL,
                  zone2_post_stand_pipe_y_max=ZONE2_POST_STAND_PIPE_Y_MAX,
@@ -523,8 +519,6 @@ class WarpEventWrapper(Wrapper):
         self._zone2_block_hit_y_threshold = int(zone2_block_hit_y_threshold)
         self._zone2_x_max = int(zone2_x_max)
         self._zone2_post_stand_hot_x_max = int(zone2_post_stand_hot_x_max)
-        self._zone2_post_stand_jump_bonus = float(zone2_post_stand_jump_bonus)
-        self._zone2_post_stand_jump_y_max = int(zone2_post_stand_jump_y_max)
         self._zone2_post_stand_pipe_x = int(zone2_post_stand_pipe_x)
         self._zone2_post_stand_pipe_x_tol = int(zone2_post_stand_pipe_x_tol)
         self._zone2_post_stand_pipe_y_max = int(zone2_post_stand_pipe_y_max)
@@ -824,8 +818,6 @@ def make_env(env_id=None):
         zone2_block_hit_y_threshold=ZONE2_BLOCK_HIT_Y_THRESHOLD,
         zone2_x_max=ZONE2_X_MAX,
         zone2_post_stand_hot_x_max=ZONE2_POST_STAND_HOT_X_MAX,
-        zone2_post_stand_jump_bonus=ZONE2_POST_STAND_JUMP_BONUS,
-        zone2_post_stand_jump_y_max=ZONE2_POST_STAND_JUMP_Y_MAX,
         zone2_post_stand_pipe_x=ZONE2_POST_STAND_PIPE_X,
         zone2_post_stand_pipe_x_tol=ZONE2_POST_STAND_PIPE_X_TOL,
         zone2_post_stand_pipe_y_max=ZONE2_POST_STAND_PIPE_Y_MAX,
