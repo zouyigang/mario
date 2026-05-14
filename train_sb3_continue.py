@@ -199,7 +199,6 @@ ZONE2_STOMP_ONLY_DELTAS = (100, 400, 500, 800, 2000, 4000, 8000)
 # 问题：原设计只有事件 2/3 的奖励，AI 纯随机探索几乎不可能在正确 x 位置起跳顶到隐藏格
 # 解法：添加事件 1 的中间奖励，引导 AI 学会在 zone2 跳跃
 ZONE2_JUMP_BONUS = 2                # 在 zone2 起跳时奖励（检测 dy 从 >=0 变为 <0）
-ZONE2_PRESENCE_BONUS = 0.6          # 在 zone2 时每步给奖励，净赚 +0.2/步 鼓励探索
 # zone2 重点区域额外奖励：收缩到隐藏格附近 x=2400，鼓励集中探索
 ZONE2_HOT_X_MIN = 2380
 ZONE2_HOT_X_MAX = 2420
@@ -215,9 +214,9 @@ ZONE2_X_MAX = 2500
 # 站上格子后 hot zone 延伸到水管右侧，跳跃奖励翻倍，引导 AI 往右上方跳上水管
 ZONE2_POST_STAND_HOT_X_MAX = 2520    # 站上格子后 hot zone 右界
 ZONE2_POST_STAND_PIPE_X = 2445       # 水管上方 x 坐标
-ZONE2_POST_STAND_PIPE_X_TOL = 5     # 水管上方 x 容差
-ZONE2_POST_STAND_PIPE_Y_MAX = 65    # 水管上方 y 阈值（水管比隐藏格高很多）
-ZONE2_POST_STAND_PIPE_BONUS = 80     # 跳上水管一次性奖励
+ZONE2_POST_STAND_PIPE_X_TOL = 10     # 水管上方 x 容差（放宽到 ±10）
+ZONE2_POST_STAND_PIPE_Y_MAX = 65     # 水管上方 y 阈值（y 越小越高）
+ZONE2_POST_STAND_PIPE_BONUS = 80     # 到达水管上方一次性奖励
 
 # 加载模型
 LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
@@ -485,7 +484,6 @@ class WarpEventWrapper(Wrapper):
                  zone2_block_hit_max_y=ZONE2_BLOCK_HIT_MAX_Y,
                  zone2_stomp_only_deltas=ZONE2_STOMP_ONLY_DELTAS,
                  zone2_jump_bonus=ZONE2_JUMP_BONUS,
-                 zone2_presence_bonus=ZONE2_PRESENCE_BONUS,
                  zone2_hot_x_min=ZONE2_HOT_X_MIN,
                  zone2_hot_x_max=ZONE2_HOT_X_MAX,
                  zone2_hot_zone_bonus=ZONE2_HOT_ZONE_BONUS,
@@ -511,7 +509,6 @@ class WarpEventWrapper(Wrapper):
         self._zone2_block_hit_max_y = int(zone2_block_hit_max_y)
         self._zone2_stomp_only_deltas = frozenset(int(v) for v in zone2_stomp_only_deltas)
         self._zone2_jump_bonus = float(zone2_jump_bonus)
-        self._zone2_presence_bonus = float(zone2_presence_bonus)
         self._zone2_hot_x_min = int(zone2_hot_x_min)
         self._zone2_hot_x_max = int(zone2_hot_x_max)
         self._zone2_hot_zone_bonus = float(zone2_hot_zone_bonus)
@@ -666,21 +663,17 @@ class WarpEventWrapper(Wrapper):
             prev_dy = self._last_dy
             x_now = snap.get("x_world", 0)
 
-            # 事件 0a：zone2 存在奖励（每步 +0.3，抵消 step_penalty 鼓励在 zone2 探索）
-            # 站上格子后取消：防止马里奥落地后原地刷 presence 分
-            if self._zone2_presence_bonus > 0 and not self._zone2_post_stand:
-                reward += self._zone2_presence_bonus
-                info["zone2_presence_bonus"] = self._zone2_presence_bonus
-
             # 事件 0d：zone2 hot zone 额外奖励（隐藏方格/水管区域）
             # 站上格子后取消：防止马里奥在 hot zone 原地刷分
+            # 顶到格子后减半：减弱原地刷分动机，鼓励冲刺触发 stand 事件
             hot_x_max = self._zone2_post_stand_hot_x_max if self._zone2_post_stand else self._zone2_hot_x_max
             if (self._zone2_hot_zone_bonus > 0
                     and not self._zone2_post_stand
                     and self._zone2_hot_x_min <= x_now <= hot_x_max):
-                reward += self._zone2_hot_zone_bonus
+                bonus = self._zone2_hot_zone_bonus * (0.5 if self._zone2_block_hit_triggered else 1.0)
+                reward += bonus
                 info["zone2_hot_zone"] = True
-                info["zone2_hot_zone_bonus"] = self._zone2_hot_zone_bonus
+                info["zone2_hot_zone_bonus"] = bonus
 
             # 事件 0b：zone2 起跳奖励（post-stand 后完全禁止，唯一目标是跳上水管）
             if dy < 0 and prev_dy >= 0:
@@ -734,10 +727,9 @@ class WarpEventWrapper(Wrapper):
                     # 站上隐藏格后 → 激活管道冲刺阶段
                     self._zone2_post_stand = True
 
-            # 事件 3：post-stand 阶段跳上水管（站稳 + 在管道 x/y 范围内）
+            # 事件 3：post-stand 阶段到达水管上方区域（位置触发，作为冲刺阶段 shaping 信号）
             if (self._zone2_post_stand
                     and not self._zone2_post_stand_pipe_triggered
-                    and self._zone2_stable_frames >= self._zone2_stand_stable_frames
                     and y_now < self._zone2_post_stand_pipe_y_max
                     and abs(x_now - self._zone2_post_stand_pipe_x) <= self._zone2_post_stand_pipe_x_tol):
                 reward += self._zone2_post_stand_pipe_bonus
@@ -819,7 +811,6 @@ def make_env(env_id=None):
         zone2_block_hit_max_y=ZONE2_BLOCK_HIT_MAX_Y,
         zone2_stomp_only_deltas=ZONE2_STOMP_ONLY_DELTAS,
         zone2_jump_bonus=ZONE2_JUMP_BONUS,
-        zone2_presence_bonus=ZONE2_PRESENCE_BONUS,
         zone2_hot_x_min=ZONE2_HOT_X_MIN,
         zone2_hot_x_max=ZONE2_HOT_X_MAX,
         zone2_hot_zone_bonus=ZONE2_HOT_ZONE_BONUS,

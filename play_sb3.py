@@ -159,7 +159,6 @@ def _render_panel(panel_h, info, action, reward, total_reward,
         ("z2_block_stand", info.get("zone2_block_stand_bonus", 0.0)),
         ("z2_jump",        info.get("zone2_jump_bonus", 0.0)),
         ("z2_high_reach",  info.get("zone2_high_reach_bonus", 0.0)),
-        ("z2_presence",    info.get("zone2_presence_bonus", 0.0)),
         ("z2_hot_zone",    info.get("zone2_hot_zone_bonus", 0.0)),
         ("warp_back_pen",  -float(info.get("warp_back_penalty", 0.0) or 0.0)
                             if info.get("warp_back") else 0.0),

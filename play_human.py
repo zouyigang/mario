@@ -574,7 +574,6 @@ def _draw_diag_panel(snap, prev_snap, info, step_idx, action,
         ("z2_block_stand", _info.get("zone2_block_stand_bonus", 0.0)),
         ("z2_jump",        _info.get("zone2_jump_bonus", 0.0)),
         ("z2_high_reach",  _info.get("zone2_high_reach_bonus", 0.0)),
-        ("z2_presence",    _info.get("zone2_presence_bonus", 0.0)),
         ("z2_hot_zone",    _info.get("zone2_hot_zone_bonus", 0.0)),
         ("z2_post_pipe",   _info.get("zone2_post_stand_pipe_bonus", 0.0)),
         ("warp_back_pen",  -float(_info.get("warp_back_penalty", 0.0) or 0.0)
