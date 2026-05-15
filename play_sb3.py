@@ -158,19 +158,11 @@ def _render_panel(panel_h, info, action, reward, total_reward,
         ("z2_block_hit",   info.get("zone2_block_hit_bonus", 0.0)),
         ("z2_block_stand", info.get("zone2_block_stand_bonus", 0.0)),
         ("z2_jump",        info.get("zone2_jump_bonus", 0.0)),
-        ("z2_high_reach",  info.get("zone2_high_reach_bonus", 0.0)),
         ("z2_hot_zone",    info.get("zone2_hot_zone_bonus", 0.0)),
+        ("z2_post_pipe",   info.get("zone2_post_stand_pipe_bonus", 0.0)),
+        ("z3_progress",    info.get("zone3_progress_bonus", 0.0)),
         ("warp_back_pen",  -float(info.get("warp_back_penalty", 0.0) or 0.0)
                             if info.get("warp_back") else 0.0),
-        ("y_layer",        info.get("y_layer_bonus_given", 0.0)),
-        ("cell_bonus",     info.get("cell_bonus_step", 0.0)),
-        ("frontier",       info.get("frontier_reward", 0.0)),
-        ("backtrack_new",  info.get("backtrack_new_cell_bonus", 0.0)),
-        ("backtrack_succ", info.get("backtrack_success_bonus", 0.0)),
-        ("post_layer_L",   info.get("post_layer_left_bonus", 0.0)),
-        ("flag_total",     info.get("flag_total_bonus", 0.0)),
-        ("death_penalty",  -float(info.get("death_penalty_applied", 0.0) or 0.0)
-                            if info.get("death_penalty_applied") else 0.0),
     ]
     named_sum = 0.0
     for name, val in components:
@@ -201,31 +193,18 @@ def _render_panel(panel_h, info, action, reward, total_reward,
 
     # ---- 触发事件 / 状态标志 ----
     flags = []
-    if info.get("new_cell"):           flags.append("NEW_CELL")
-    if info.get("new_y_layer"):        flags.append("NEW_Y_LAYER")
-    if info.get("backtrack_success"):  flags.append("BACKTRACK_SUCCESS")
-    if info.get("strategic_backtrack"): flags.append("BACKTRACK_TURN")
-    if info.get("backtrack_active"):   flags.append("backtrack_active")
-    if info.get("post_layer_left_active"):
-        flags.append("postL_active depth={}".format(info.get("post_layer_left_depth", 0)))
-    if info.get("post_layer_committed"): flags.append("postL_COMMITTED")
-    if info.get("post_layer_zone_active"): flags.append("postL_zone_active")
-    if info.get("frontier_committed"):
-        flags.append("FRONTIER (max_x={})".format(info.get("frontier_max_x", 0)))
-    if info.get("correct_wrap_new_area"): flags.append("CORRECT_WRAP")
-    if info.get("teleport_branch"):    flags.append("TELEPORT")
-    if info.get("dead_loop"):          flags.append("DEAD_LOOP")
-    if info.get("flag_get"):           flags.append("FLAG_GET")
-    if info.get("no_new_cell"):        flags.append("no_progress")
-    if info.get("warp_fwd"):           flags.append("WARP_FWD_NEW")
-    if info.get("warp_back"):          flags.append("WARP_BACK ({})".format(info.get("warp_back_tag", "?")))
-    if info.get("coord_wrap"):         flags.append("COORD_WRAP")
-    if info.get("zone2_block_hit"):    flags.append("Z2_BLOCK_HIT")
-    if info.get("zone2_block_stand"):  flags.append("Z2_BLOCK_STAND")
-    if info.get("zone2_jump"):         flags.append("Z2_JUMP")
-    if info.get("zone2_high_reach"):   flags.append("Z2_HIGH_REACH")
-    if info.get("zone2_hot_zone"):     flags.append("Z2_HOT_ZONE")
-    if info.get("pipe_enter_bonus"):   flags.append("PIPE_ENTER")
+    if info.get("dead_loop"):            flags.append("DEAD_LOOP")
+    if info.get("flag_get"):             flags.append("FLAG_GET")
+    if info.get("warp_fwd"):             flags.append("WARP_FWD_NEW")
+    if info.get("warp_back"):            flags.append("WARP_BACK ({})".format(info.get("warp_back_tag", "?")))
+    if info.get("coord_wrap"):           flags.append("COORD_WRAP")
+    if info.get("zone2_block_hit"):      flags.append("Z2_BLOCK_HIT")
+    if info.get("zone2_block_stand"):    flags.append("Z2_BLOCK_STAND")
+    if info.get("zone2_jump"):           flags.append("Z2_JUMP")
+    if info.get("zone2_hot_zone"):       flags.append("Z2_HOT_ZONE")
+    if info.get("zone2_post_stand_pipe"): flags.append("Z2_POST_PIPE")
+    if info.get("pipe_enter_bonus"):     flags.append("PIPE_ENTER")
+    if info.get("zone3_progress_bonus"): flags.append("Z3+{:.1f}".format(float(info.get("zone3_progress_bonus", 0.0))))
 
     if _room(y0):
         _put_line(img, "-- flags/events --", 12, y0, PANEL_DIM, 0.42, 1)
@@ -251,21 +230,16 @@ def _render_panel(panel_h, info, action, reward, total_reward,
     # ---- 累计统计 ----
     totals_lines = [
         ("-- episode totals --", PANEL_DIM),
-        ("max_x={:>5}  cells={:>4}".format(
-            int(info.get("episode_max_x", totals.get("max_x", 0)) or 0),
-            int(info.get("cells_visited", 0) or 0)), PANEL_FG),
-        ("ep_cell_bonus={}  stall_pen={}".format(
-            _fmt(info.get("episode_cell_bonus", 0.0), 7, 1, sign=False),
-            _fmt(info.get("episode_stall_penalty", 0.0), 6, 1, sign=False)), PANEL_FG),
-        ("sum_y_layer ={}  sum_cell  ={}".format(
-            _fmt(totals["y_layer"], 7, 1, sign=False),
-            _fmt(totals["cell_bonus"], 7, 1, sign=False)), PANEL_FG),
-        ("sum_post_L  ={}  sum_back_S={}".format(
-            _fmt(totals["post_layer_L"], 7, 1, sign=False),
-            _fmt(totals["backtrack_succ"], 7, 1, sign=False)), PANEL_FG),
-        ("sum_back_new={}  sum_front ={}".format(
-            _fmt(totals["backtrack_new"], 7, 1, sign=False),
-            _fmt(totals["frontier"], 7, 1, sign=False)), PANEL_FG),
+        ("max_x={:>5}".format(
+            int(info.get("episode_max_x_ever", totals.get("max_x", 0)) or 0)), PANEL_FG),
+        ("sum_warp_fwd ={}  sum_pipe ={}".format(
+            _fmt(totals["warp_fwd"], 7, 1, sign=False),
+            _fmt(totals["pipe_enter"], 7, 1, sign=False)), PANEL_FG),
+        ("sum_zone2    ={}  sum_z3   ={}".format(
+            _fmt(totals["zone2"], 7, 1, sign=False),
+            _fmt(totals["z3_progress"], 7, 1, sign=False)), PANEL_FG),
+        ("sum_warp_back={}".format(
+            _fmt(-totals["warp_back_pen"], 7, 1, sign=False)), PANEL_FG),
     ]
     for txt, col in totals_lines:
         if not _room(y0):
@@ -342,22 +316,23 @@ def _compose_window(game_rgb, panel_img):
 # ======================
 def _new_totals():
     return {
-        "y_layer": 0.0, "cell_bonus": 0.0, "frontier": 0.0,
-        "backtrack_new": 0.0, "backtrack_succ": 0.0, "post_layer_L": 0.0,
-        "flag_total": 0.0, "death_penalty": 0.0, "max_x": 0,
+        "warp_fwd": 0.0, "pipe_enter": 0.0, "zone2": 0.0,
+        "z3_progress": 0.0, "warp_back_pen": 0.0, "max_x": 0,
     }
 
 
 def _update_totals(totals, info):
-    totals["y_layer"]        += float(info.get("y_layer_bonus_given", 0.0) or 0.0)
-    totals["cell_bonus"]     += float(info.get("cell_bonus_step", 0.0) or 0.0)
-    totals["frontier"]       += float(info.get("frontier_reward", 0.0) or 0.0)
-    totals["backtrack_new"]  += float(info.get("backtrack_new_cell_bonus", 0.0) or 0.0)
-    totals["backtrack_succ"] += float(info.get("backtrack_success_bonus", 0.0) or 0.0)
-    totals["post_layer_L"]   += float(info.get("post_layer_left_bonus", 0.0) or 0.0)
-    totals["flag_total"]     += float(info.get("flag_total_bonus", 0.0) or 0.0)
-    totals["death_penalty"]  += float(info.get("death_penalty_applied", 0.0) or 0.0)
-    mx = int(info.get("episode_max_x", 0) or 0)
+    totals["warp_fwd"]    += float(info.get("warp_fwd_bonus", 0.0) or 0.0)
+    totals["pipe_enter"]  += float(info.get("pipe_enter_bonus", 0.0) or 0.0)
+    totals["zone2"]       += (float(info.get("zone2_block_hit_bonus", 0.0) or 0.0)
+                              + float(info.get("zone2_block_stand_bonus", 0.0) or 0.0)
+                              + float(info.get("zone2_jump_bonus", 0.0) or 0.0)
+                              + float(info.get("zone2_hot_zone_bonus", 0.0) or 0.0)
+                              + float(info.get("zone2_post_stand_pipe_bonus", 0.0) or 0.0))
+    totals["z3_progress"] += float(info.get("zone3_progress_bonus", 0.0) or 0.0)
+    if info.get("warp_back"):
+        totals["warp_back_pen"] += float(info.get("warp_back_penalty", 0.0) or 0.0)
+    mx = int(info.get("episode_max_x_ever", 0) or 0)
     if mx > totals["max_x"]:
         totals["max_x"] = mx
 
@@ -365,12 +340,9 @@ def _update_totals(totals, info):
 def _collect_event_lines(step_idx, info, reward):
     out = []
     if info.get("flag_get"):
-        out.append("S{}: FLAG_GET (+{:.1f})".format(step_idx,
-                                                    float(info.get("flag_total_bonus", 0.0) or 0.0)))
+        out.append("S{}: FLAG_GET".format(step_idx))
     if info.get("dead_loop"):
         out.append("S{}: DEAD_LOOP".format(step_idx))
-    if info.get("teleport_branch"):
-        out.append("S{}: TELEPORT".format(step_idx))
     if info.get("warp_fwd"):
         out.append("S{}: WARP_FWD_NEW (+{:.0f})".format(
             step_idx, float(info.get("warp_fwd_bonus", 0.0) or 0.0)))
@@ -392,18 +364,12 @@ def _collect_event_lines(step_idx, info, reward):
     if info.get("zone2_jump"):
         out.append("S{}: Z2_JUMP (+{:.0f})".format(
             step_idx, float(info.get("zone2_jump_bonus", 0.0) or 0.0)))
-    if info.get("zone2_high_reach"):
-        out.append("S{}: Z2_HIGH_REACH (+{:.0f})".format(
-            step_idx, float(info.get("zone2_high_reach_bonus", 0.0) or 0.0)))
-    if info.get("backtrack_success"):
-        out.append("S{}: BACKTRACK_SUCC (+{:.1f})".format(
-            step_idx, float(info.get("backtrack_success_bonus", 0.0) or 0.0)))
-    if info.get("new_y_layer"):
-        out.append("S{}: NEW_Y_LAYER (+{:.1f})".format(
-            step_idx, float(info.get("y_layer_bonus_given", 0.0) or 0.0)))
-    if info.get("death_penalty_applied"):
-        out.append("S{}: DEATH (-{:.1f})".format(
-            step_idx, float(info.get("death_penalty_applied", 0.0) or 0.0)))
+    if info.get("zone2_post_stand_pipe"):
+        out.append("S{}: Z2_POST_PIPE (+{:.0f})".format(
+            step_idx, float(info.get("zone2_post_stand_pipe_bonus", 0.0) or 0.0)))
+    if info.get("zone3_progress_bonus"):
+        out.append("S{}: Z3_PROGRESS (+{:.1f})".format(
+            step_idx, float(info.get("zone3_progress_bonus", 0.0) or 0.0)))
     return out
 
 
@@ -419,6 +385,10 @@ def _format_episode_exit(info):
             label = "老路超时终止"
         elif tag == "BIG_JUMP":
             label = "异常跳变终止"
+        elif tag == "ZONE2_X_MAX":
+            label = "zone2 越界终止"
+        elif tag == "ZONE3_X_MAX":
+            label = "zone3 越界终止"
         else:
             label = "管道回传终止"
         suffix = "[{} {} -{:.0f}]".format(label, tag, pen)

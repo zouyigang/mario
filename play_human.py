@@ -324,17 +324,23 @@ else:
 
 
 # ---------- 退出原因（沿用） ----------
+_WARP_BACK_LABELS = {
+    "WRONG_LOOP_TIMEOUT": "老路超时终止",
+    "BIG_JUMP": "异常跳变终止",
+    "ZONE2_X_MAX": "zone2 越界终止",
+    "ZONE3_X_MAX": "zone3 越界终止",
+}
+
+
 def _format_episode_exit_reason(terminated, truncated, info):
     if info.get("dead_loop"):
         tag = "循环超时（死循环检测：长时间横向无足够进展）"
     elif info.get("flag_get"):
         tag = "到达终点（拿旗）"
-    elif info.get("teleport_immediate"):
-        tag = "立即回传"
-    elif info.get("teleport_branch"):
-        tag = "分支回传（走错路/画面相似回落，wrong_branch_steps={}）".format(
-            info.get("wrong_branch_steps", "?")
-        )
+    elif info.get("warp_back"):
+        wb = info.get("warp_back_tag", "?")
+        label = _WARP_BACK_LABELS.get(wb, "管道回传终止")
+        tag = "{}（{}）".format(label, wb)
     elif terminated:
         tag = "游戏内终止（多为死亡或生命耗尽，且非拿旗）"
     elif truncated:
@@ -346,18 +352,15 @@ def _format_episode_exit_reason(terminated, truncated, info):
         tag,
         "terminated={} truncated={}".format(terminated, truncated),
     ]
-    mx = info.get("episode_max_x")
+    mx = info.get("episode_max_x_ever")
     if mx is not None:
         parts.append("MaxX={}".format(mx))
-    tc = info.get("teleport_count")
-    if tc is not None:
-        parts.append("teleport_count={}".format(tc))
-    if info.get("coordinate_wrap"):
-        parts.append("末帧coordinate_wrap")
-    if info.get("correct_wrap_new_area"):
-        parts.append("末帧correct_wrap_new_area")
-    if info.get("no_progress"):
-        parts.append("末帧no_progress")
+    fc = info.get("episode_warp_fwd_count")
+    if fc:
+        parts.append("warp_fwd x{}".format(fc))
+    cc = info.get("episode_coord_wrap_count")
+    if cc:
+        parts.append("coord_wrap x{}".format(cc))
     return " | ".join(parts)
 
 
@@ -365,20 +368,16 @@ def _info_flag_lines(info):
     lines = []
     if info.get("flag_get"):              lines.append("FLAG_GET")
     if info.get("dead_loop"):             lines.append("DEAD_LOOP")
-    if info.get("teleport_branch"):       lines.append("TELEPORT ws={}".format(info.get("wrong_branch_steps", "")))
-    if info.get("teleport_immediate"):    lines.append("TELEPORT_IMMEDIATE")
-    if info.get("correct_wrap_new_area"): lines.append("CORRECT_WRAP")
-    if info.get("coordinate_wrap") or info.get("coord_wrap"): lines.append("COORD_WRAP")
-    if info.get("no_progress"):           lines.append("no_progress")
     if info.get("warp_fwd"):              lines.append("WARP_FWD_NEW")
     if info.get("warp_back"):             lines.append("WARP_BACK ({})".format(info.get("warp_back_tag", "?")))
+    if info.get("coord_wrap"):            lines.append("COORD_WRAP")
     if info.get("zone2_block_hit"):       lines.append("Z2_BLOCK_HIT")
     if info.get("zone2_block_stand"):     lines.append("Z2_BLOCK_STAND")
     if info.get("zone2_jump"):            lines.append("Z2_JUMP")
-    if info.get("zone2_high_reach"):      lines.append("Z2_HIGH_REACH")
     if info.get("zone2_hot_zone"):        lines.append("Z2_HOT_ZONE")
     if info.get("zone2_post_stand_pipe"): lines.append("Z2_POST_PIPE")
     if info.get("pipe_enter_bonus"):      lines.append("PIPE_ENTER")
+    if info.get("zone3_progress_bonus"):  lines.append("Z3+{:.1f}".format(float(info.get("zone3_progress_bonus", 0.0))))
     return lines
 
 
@@ -573,9 +572,9 @@ def _draw_diag_panel(snap, prev_snap, info, step_idx, action,
         ("z2_block_hit",   _info.get("zone2_block_hit_bonus", 0.0)),
         ("z2_block_stand", _info.get("zone2_block_stand_bonus", 0.0)),
         ("z2_jump",        _info.get("zone2_jump_bonus", 0.0)),
-        ("z2_high_reach",  _info.get("zone2_high_reach_bonus", 0.0)),
         ("z2_hot_zone",    _info.get("zone2_hot_zone_bonus", 0.0)),
         ("z2_post_pipe",   _info.get("zone2_post_stand_pipe_bonus", 0.0)),
+        ("z3_progress",    _info.get("zone3_progress_bonus", 0.0)),
         ("warp_back_pen",  -float(_info.get("warp_back_penalty", 0.0) or 0.0)
                             if _info.get("warp_back") else 0.0),
     ]
