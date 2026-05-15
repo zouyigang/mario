@@ -219,6 +219,16 @@ ZONE2_POST_STAND_PIPE_X_TOL = 10     # 水管上方 x 容差（放宽到 ±10）
 ZONE2_POST_STAND_PIPE_Y_MAX = 65     # 水管上方 y 阈值（y 越小越高）
 ZONE2_POST_STAND_PIPE_BONUS = 80     # 到达水管上方一次性奖励
 
+# zone3 探索奖励：第二次 WARP_FWD_NEW 之后激活（zone2 出管 → 进入第三段图）
+# 目的：把 zone3 (x>3400) 未知区域的期望值从负翻正，避免模型选择"已知 WARP_BACK_REVISIT -10"作为安全出口
+# 只在 tag==NORMAL 且 x_world 突破历史最远（new ground）时给，奖励 = (x - max(max_x_ever, ZONE3_X_MIN)) × ZONE3_DX_BONUS
+# new-ground-only 防御性收紧：来回走也不会净赚（往左走不到、再往右走的部分也不算新地段）
+ZONE3_X_MIN = 3400
+ZONE3_DX_BONUS = 0.3
+# zone3 x 超限截断：zone3 激活后，若 Mario 的 x_world 超过此阈值，
+# 说明已错过钻水管时机进入重复路段，立即终止本局按死亡处理防止刷分
+ZONE3_X_MAX = 3660
+
 # PPO 超参
 ENT_COEF = 0.03  # 提高初始熵系数，让模型更频繁随机尝试 DOWN 等非主流动作
 ENT_COEF_MAX = 0.08  # 自适应熵上限；7 动作空间 0.2 会把 logits 抹平导致策略崩塌
@@ -383,7 +393,8 @@ def _collect_warp_snap(env):
             e = getattr(e, "env", None)
     if smb is None:
         return None
-    snap = {"x_world": 0, "x_screen": 0, "player_state": 8, "y_pixel": 200, "score": 0}
+    snap = {"x_world": 0, "x_screen": 0, "player_state": 8, "y_pixel": 200, "score": 0,
+            "area": 0, "area_type": 0, "foreground": 0}
     try:
         snap["x_world"] = int(smb._x_position)
     except Exception:
@@ -404,6 +415,16 @@ def _collect_warp_snap(env):
         snap["score"] = int(smb._score)
     except Exception:
         pass
+    try:
+        snap["area"] = int(smb._area)
+    except Exception:
+        pass
+    try:
+        ram = smb.ram
+        snap["area_type"] = int(ram[0x074E])
+        snap["foreground"] = int(ram[0x074F])
+    except Exception:
+        pass
     return snap
 
 
@@ -411,21 +432,35 @@ def _collect_warp_snap(env):
 _PIPE_STATES = (0x02, 0x03, 0x07)
 
 
-def _classify_step(curr_snap, prev_snap, action, prev_max_x_ever):
+def _area_key(snap):
+    """区域唯一标识：(area, area_type, foreground)。
+    钻管道进入新地段时该三元组会变化，是区分"前传新区"与"回传老区"的可靠依据。"""
+    return (snap.get("area", 0), snap.get("area_type", 0), snap.get("foreground", 0))
+
+
+def _classify_step(curr_snap, prev_snap, action, prev_max_x_ever, visited_area_keys=None):
     """
     返回事件 tag。规则（实测自 play_human.py 三类样本）：
-      |Δx_world| ≤ WARP_DX_THRESHOLD                       → NORMAL
-      |Δx_world| 大 且 (action==DOWN(10) 或 prev/curr state 在管道状态)
-                                                            → WARP_*；sign(Δx) 定方向；
-                                                              curr.x_world > 之前的 max_x_ever → NEW，否则 REVISIT
+      区域三元组(area,area_type,foreground)变化 且 有管道信号
+                                                            → WARP_*；目标区域之前没进过 → FWD_NEW，
+                                                              进过 → BACK_REVISIT（钻错管道被回传到老区）
+      |Δx_world| ≤ WARP_DX_THRESHOLD 且 区域未变             → NORMAL
+      |Δx_world| 大 且 同区域内 且 有管道信号                 → WARP_*；sign(Δx) 定方向
       |Δx_world| 大 且 无管道信号 且 |Δx_screen| < WARP_SCREEN_STAY
                                                             → COORD_WRAP（page byte 回卷，实际照常前进）
       其它                                                  → BIG_JUMP
+
+    钻管道进新区域时 x_world 会重置成小值（如 56），单看 Δx 符号会把"前传新区"
+    误判成"回传"。因此区域三元组变化时改用 visited_area_keys 判定方向。
     """
     if prev_snap is None or curr_snap is None:
         return "INIT"
     dx = curr_snap.get("x_world", 0) - prev_snap.get("x_world", 0)
-    if abs(dx) <= WARP_DX_THRESHOLD:
+    curr_key = _area_key(curr_snap)
+    prev_key = _area_key(prev_snap)
+    area_changed = (curr_key != prev_key)
+
+    if abs(dx) <= WARP_DX_THRESHOLD and not area_changed:
         return "NORMAL"
 
     is_down_action = (action == 10)
@@ -433,9 +468,13 @@ def _classify_step(curr_snap, prev_snap, action, prev_max_x_ever):
         is_down_action
         or prev_snap.get("player_state", 0) in _PIPE_STATES
         or curr_snap.get("player_state", 0) in _PIPE_STATES
+        or area_changed
     )
 
     if pipe_signal:
+        if area_changed:
+            visited = visited_area_keys or set()
+            return "WARP_FWD_NEW" if curr_key not in visited else "WARP_BACK_REVISIT"
         new_or_revisit = "NEW" if curr_snap.get("x_world", 0) > prev_max_x_ever else "REVISIT"
         return ("WARP_FWD_" if dx > 0 else "WARP_BACK_") + new_or_revisit
 
@@ -494,7 +533,10 @@ class WarpEventWrapper(Wrapper):
                  zone2_post_stand_pipe_x=ZONE2_POST_STAND_PIPE_X,
                  zone2_post_stand_pipe_x_tol=ZONE2_POST_STAND_PIPE_X_TOL,
                  zone2_post_stand_pipe_y_max=ZONE2_POST_STAND_PIPE_Y_MAX,
-                 zone2_post_stand_pipe_bonus=ZONE2_POST_STAND_PIPE_BONUS):
+                 zone2_post_stand_pipe_bonus=ZONE2_POST_STAND_PIPE_BONUS,
+                 zone3_x_min=ZONE3_X_MIN,
+                 zone3_dx_bonus=ZONE3_DX_BONUS,
+                 zone3_x_max=ZONE3_X_MAX):
         super().__init__(env)
         self._warp_back_penalty = float(warp_back_penalty)
         self._warp_fwd_bonus = float(warp_fwd_bonus)
@@ -520,6 +562,9 @@ class WarpEventWrapper(Wrapper):
         self._zone2_post_stand_pipe_x_tol = int(zone2_post_stand_pipe_x_tol)
         self._zone2_post_stand_pipe_y_max = int(zone2_post_stand_pipe_y_max)
         self._zone2_post_stand_pipe_bonus = float(zone2_post_stand_pipe_bonus)
+        self._zone3_x_min = int(zone3_x_min)
+        self._zone3_dx_bonus = float(zone3_dx_bonus)
+        self._zone3_x_max = int(zone3_x_max)
         self._prev_snap = None
         self._max_x_ever = 0
         self._warp_fwd_count = 0
@@ -543,11 +588,19 @@ class WarpEventWrapper(Wrapper):
         # zone2 post-stand：站上隐藏格后激活，引导 AI 往右上方水管跳
         self._zone2_post_stand = False
         self._zone2_post_stand_pipe_triggered = False
+        # zone3：第二次 WARP_FWD_NEW（zone2 出管）后激活
+        self._zone3_active = False
+        self._zone3_progress_total = 0.0
+        # 本局已到访过的区域三元组集合，用于区分前传新区 / 回传老区
+        self._visited_area_keys = set()
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._prev_snap = _collect_warp_snap(self.env)
         self._max_x_ever = self._prev_snap.get("x_world", 0) if self._prev_snap else 0
+        self._visited_area_keys = set()
+        if self._prev_snap is not None:
+            self._visited_area_keys.add(_area_key(self._prev_snap))
         self._warp_fwd_count = 0
         self._coord_wrap_count = 0
         self._wrong_loop_count = 0
@@ -564,6 +617,8 @@ class WarpEventWrapper(Wrapper):
         self._zone2_in_jump = False
         self._zone2_post_stand = False
         self._zone2_post_stand_pipe_triggered = False
+        self._zone3_active = False
+        self._zone3_progress_total = 0.0
         return obs, info
 
     def step(self, action):
@@ -574,7 +629,8 @@ class WarpEventWrapper(Wrapper):
         except Exception:
             act_int = -1
 
-        tag = _classify_step(snap, self._prev_snap, act_int, self._max_x_ever)
+        tag = _classify_step(snap, self._prev_snap, act_int, self._max_x_ever,
+                             self._visited_area_keys)
 
         # ---- wrong-loop 状态机：在 COORD_WRAP 之后，必须在 grace 步数内进入水管 ----
         if tag in self._WARP_EVENT_TAGS:
@@ -624,6 +680,7 @@ class WarpEventWrapper(Wrapper):
                 self._zone2_active = True
             else:
                 self._zone2_active = False
+                self._zone3_active = True
         elif tag in ("WARP_BACK_REVISIT", "WARP_BACK_NEW", "BIG_JUMP", "WRONG_LOOP_TIMEOUT"):
             reward -= self._warp_back_penalty
             info["warp_back"] = True
@@ -726,6 +783,21 @@ class WarpEventWrapper(Wrapper):
             # 记录本帧 dy 给下一步用（顶击判定需要 prev_dy<0）
             self._last_dy = dy
 
+        # ---- zone3 探索推进奖励：第二次前传后、突破历史最远 x 才给 ----
+        # 只在 NORMAL 步、x>ZONE3_X_MIN 且 x>_max_x_ever（new ground）时累计；
+        # 排除传送/COORD_WRAP/死亡步，且来回走也无法刷分（max_x_ever 单调递增）
+        if (self._zone3_active
+                and tag == "NORMAL"
+                and not terminated
+                and snap is not None
+                and snap.get("x_world", 0) > self._zone3_x_min
+                and snap.get("x_world", 0) > self._max_x_ever):
+            new_ground = snap.get("x_world", 0) - max(self._max_x_ever, self._zone3_x_min)
+            bonus = new_ground * self._zone3_dx_bonus
+            reward += bonus
+            self._zone3_progress_total += bonus
+            info["zone3_progress_bonus"] = bonus
+
         # ---- zone2 x 超限截断：防止走过隐藏格/水管区域后继续刷分 ----
         # 只要在 zone2 中且 x 超过阈值就截断
         if (self._zone2_active
@@ -738,9 +810,22 @@ class WarpEventWrapper(Wrapper):
             info["warp_back_penalty"] = DEATH_PENALTY_SEEN
             truncated = True
 
+        # ---- zone3 x 超限截断：错过钻水管时机，防止继续刷分 ----
+        # 只要在 zone3 中且 x 超过阈值就截断
+        if (self._zone3_active
+                and self._zone3_x_max > 0
+                and snap is not None
+                and snap.get("x_world", 0) > self._zone3_x_max):
+            reward -= DEATH_PENALTY_SEEN
+            info["warp_back"] = True
+            info["warp_back_tag"] = "ZONE3_X_MAX"
+            info["warp_back_penalty"] = DEATH_PENALTY_SEEN
+            truncated = True
+
         # 更新 max_x_ever 用于下一步分类
         if snap is not None:
             self._max_x_ever = max(self._max_x_ever, snap.get("x_world", 0))
+            self._visited_area_keys.add(_area_key(snap))
             self._prev_snap = snap
 
         if terminated or truncated:
@@ -751,6 +836,7 @@ class WarpEventWrapper(Wrapper):
             info["episode_zone2_block_hits"] = self._zone2_block_hit_count
             info["episode_zone2_block_stands"] = self._zone2_block_stand_count
             info["episode_zone2_post_stand_pipe"] = 1 if self._zone2_post_stand_pipe_triggered else 0
+            info["episode_zone3_progress_total"] = float(self._zone3_progress_total)
 
         return obs, reward, terminated, truncated, info
 
@@ -813,6 +899,9 @@ def make_env(env_id=None):
         zone2_post_stand_pipe_x_tol=ZONE2_POST_STAND_PIPE_X_TOL,
         zone2_post_stand_pipe_y_max=ZONE2_POST_STAND_PIPE_Y_MAX,
         zone2_post_stand_pipe_bonus=ZONE2_POST_STAND_PIPE_BONUS,
+        zone3_x_min=ZONE3_X_MIN,
+        zone3_dx_bonus=ZONE3_DX_BONUS,
+        zone3_x_max=ZONE3_X_MAX,
     )
     env = Monitor(env)
     return env
@@ -993,6 +1082,10 @@ class EpisodeLogCallback(BaseCallback):
                         label = "老路超时终止"
                     elif tag == "BIG_JUMP":
                         label = "异常跳变终止"
+                    elif tag == "ZONE2_X_MAX":
+                        label = "zone2 越界终止"
+                    elif tag == "ZONE3_X_MAX":
+                        label = "zone3 越界终止"
                     else:
                         label = "管道回传终止"
                     suffix = "  [{} {} -{:.0f}]".format(label, tag, pen)
@@ -1024,6 +1117,9 @@ class EpisodeLogCallback(BaseCallback):
                 z2p = info.get("episode_zone2_post_stand_pipe")
                 if z2p:
                     extras.append("z2_pipe")
+                z3p = info.get("episode_zone3_progress_total", 0.0)
+                if z3p > 0:
+                    extras.append("z3+{:.1f}".format(float(z3p)))
                 extras_s = ("  " + " ".join("[{}]".format(x) for x in extras)) if extras else ""
 
                 ec = getattr(self.model, "ent_coef", None)
