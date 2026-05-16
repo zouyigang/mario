@@ -143,6 +143,9 @@ FLAG_GET_BONUS = 50           # 通关额外奖励，远大于死亡惩罚，鼓
 DEAD_LOOP_STEPS = 500        # 约 33 秒无进展才结束（为传送台/电梯留足时间）
 DEAD_LOOP_MIN_DX = 8
 DEAD_LOOP_PENALTY_SEEN = 50
+# 跨区域（钻管道/换 area）时 _x_position 会重置成小值，x 大幅回退即视为换区，
+# 此时必须重置死循环锚点，否则新区域里 current_x 永远低于旧锚点，前进也被误判成死循环。
+DEAD_LOOP_RESET_DROP = 100
 
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
 # 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
@@ -286,10 +289,12 @@ def _get_mario_y_from_env(env):
 class DeadLoopDetector(Wrapper):
     """连续 N 步横向无进展则强制 truncated=True 结束本局。"""
 
-    def __init__(self, env, no_progress_max_steps, min_dx):
+    def __init__(self, env, no_progress_max_steps, min_dx,
+                 reset_drop=DEAD_LOOP_RESET_DROP):
         super().__init__(env)
         self._no_progress_max = no_progress_max_steps
         self._min_dx = min_dx
+        self._reset_drop = reset_drop
         self._x_anchor = 0
         self._no_progress_steps = 0
 
@@ -303,7 +308,11 @@ class DeadLoopDetector(Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(action)
         current_x = _get_mario_x_from_env(self.env)
         if self._no_progress_max > 0:
-            if current_x - self._x_anchor >= self._min_dx:
+            if current_x - self._x_anchor <= -self._reset_drop:
+                # x 大幅回退：钻管道/换 area，坐标已重置 —— 重锚，不计死循环
+                self._x_anchor = current_x
+                self._no_progress_steps = 0
+            elif current_x - self._x_anchor >= self._min_dx:
                 self._x_anchor = current_x
                 self._no_progress_steps = 0
             else:
