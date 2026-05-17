@@ -150,8 +150,8 @@ DEAD_LOOP_RESET_DROP = 100
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
 # 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
 # BASE 要大于「该关正常快通步数 + 可能出现的蹭分步数」，否则快通已贴顶、蹭分只靠多走 +1 会反超
-SPEED_BONUS_BASE_STEPS = 500
-SPEED_BONUS_PER_STEP = 2
+SPEED_BONUS_BASE_STEPS = 700
+SPEED_BONUS_PER_STEP = 1.5
 
 # 管道传送事件（与 play_human.py 的 _classify_step 对齐）
 # 单步 |Δx_world| > 阈值才视为传送；屏内位移阈值用于区分 coord wrap（page byte 回卷，实际照常前进）
@@ -242,6 +242,25 @@ ZONE3_X_MAX = 3700
 ZONE3_PIPE_X = 3660            # 正确水管 x_world 中心
 ZONE3_PIPE_X_TOL = 32          # 钻管判定的 x 容差（跳帧 4 下留足余量）
 ZONE3_PIPE_ENTER_BONUS = 80    # 在水管附近进入管道态的密集奖励（教模型按 DOWN 下钻）
+
+# zone4 海底前进 shaping：第 3 次前传后（在 zone4）按新地段累积奖励。
+# zone4 原本无 progress 奖励，每步净收益≈0甚至负（海底游得慢 + step_penalty 0.4），
+# 模型没有过关动力、游多远基本随机。按 new-ground 给分让海底前进每步净正。
+ZONE4_DX_BONUS = 0.6           # 每 px 新地段奖励；比 zone3(0.4) 高，海底慢需更强前进信号
+
+# zone5 前进 shaping：第 4 次前传后（在 zone5，8-4 最后一段）按新地段累积奖励。
+# zone5 无 progress 奖励时，钻 x≈4260 错误水管(-40 干净终局) 与继续走再死(-40) 收益持平，
+# 模型没理由不钻错管。zone5 一路向右到终点旗杆，不封顶、不截断。
+ZONE5_DX_BONUS = 0.4           # 每 px 新地段奖励；zone5 是城堡陆地、速度正常，同 zone3
+
+# zone5 火坑（x≈4435–4500 岩浆+尖刺）：模型收敛于直接跑进火坑自杀。
+# 引导：火坑上方腾空时每步给 bonus（奖励跳跃弧；岩浆上方无法久留、落下即死 → 不可 farm），
+# 成功跨过火坑右缘且存活再给一次性大奖励。
+ZONE5_PIT_X_MIN = 4435         # 火坑左缘 x_world
+ZONE5_PIT_X_MAX = 4505         # 火坑右缘 x_world
+ZONE5_PIT_AIR_Y = 165          # y_pixel < 此值视为腾空（地面 y_pixel≈176，跳起 y 变小）
+ZONE5_PIT_AIR_BONUS = 5        # 火坑上方腾空时每步奖励（鼓励起跳跨坑）
+ZONE5_PIT_CLEAR_BONUS = 120    # x 越过火坑右缘且存活 → 成功跨坑一次性大奖励
 
 # PPO 超参
 ENT_COEF = 0.03  # 提高初始熵系数，让模型更频繁随机尝试 DOWN 等非主流动作
@@ -565,7 +584,14 @@ class WarpEventWrapper(Wrapper):
                  zone3_x_max=ZONE3_X_MAX,
                  zone3_pipe_x=ZONE3_PIPE_X,
                  zone3_pipe_x_tol=ZONE3_PIPE_X_TOL,
-                 zone3_pipe_enter_bonus=ZONE3_PIPE_ENTER_BONUS):
+                 zone3_pipe_enter_bonus=ZONE3_PIPE_ENTER_BONUS,
+                 zone4_dx_bonus=ZONE4_DX_BONUS,
+                 zone5_dx_bonus=ZONE5_DX_BONUS,
+                 zone5_pit_x_min=ZONE5_PIT_X_MIN,
+                 zone5_pit_x_max=ZONE5_PIT_X_MAX,
+                 zone5_pit_air_y=ZONE5_PIT_AIR_Y,
+                 zone5_pit_air_bonus=ZONE5_PIT_AIR_BONUS,
+                 zone5_pit_clear_bonus=ZONE5_PIT_CLEAR_BONUS):
         super().__init__(env)
         self._warp_back_penalty = float(warp_back_penalty)
         self._warp_back_revisit_penalty = float(warp_back_revisit_penalty)
@@ -598,6 +624,13 @@ class WarpEventWrapper(Wrapper):
         self._zone3_pipe_x = int(zone3_pipe_x)
         self._zone3_pipe_x_tol = int(zone3_pipe_x_tol)
         self._zone3_pipe_enter_bonus = float(zone3_pipe_enter_bonus)
+        self._zone4_dx_bonus = float(zone4_dx_bonus)
+        self._zone5_dx_bonus = float(zone5_dx_bonus)
+        self._zone5_pit_x_min = int(zone5_pit_x_min)
+        self._zone5_pit_x_max = int(zone5_pit_x_max)
+        self._zone5_pit_air_y = int(zone5_pit_air_y)
+        self._zone5_pit_air_bonus = float(zone5_pit_air_bonus)
+        self._zone5_pit_clear_bonus = float(zone5_pit_clear_bonus)
         self._prev_snap = None
         self._max_x_ever = 0
         self._warp_fwd_count = 0
@@ -628,6 +661,10 @@ class WarpEventWrapper(Wrapper):
         self._zone3_pipe_enter_triggered = False
         # zone4：第 3 次前传后进入，x 重新从小值开始，单独记录本局最远 x
         self._zone4_max_x = 0
+        self._zone4_progress_total = 0.0
+        # zone5：第 4 次前传后进入（8-4 最后一段），x 为连续大值，复用 max_x_ever 做基线
+        self._zone5_progress_total = 0.0
+        self._zone5_pit_cleared = False
         # 本局已到访过的区域三元组集合，用于区分前传新区 / 回传老区
         self._visited_area_keys = set()
 
@@ -658,6 +695,9 @@ class WarpEventWrapper(Wrapper):
         self._zone3_progress_total = 0.0
         self._zone3_pipe_enter_triggered = False
         self._zone4_max_x = 0
+        self._zone4_progress_total = 0.0
+        self._zone5_progress_total = 0.0
+        self._zone5_pit_cleared = False
         return obs, info
 
     def step(self, action):
@@ -896,6 +936,54 @@ class WarpEventWrapper(Wrapper):
             info["warp_back_penalty"] = DEATH_PENALTY_SEEN
             truncated = True
 
+        # ---- zone4 海底前进 shaping：第 3 次前传后（在 zone4）按新地段给分 ----
+        # zone4 无 progress 奖励时每步净收益≈0甚至负，模型没有过关动力。
+        # 用 _zone4_max_x 做 new-ground 基线（它在下方"更新 max_x_ever"块里递增），
+        # 来回游无法刷分；只奖励 NORMAL 步，排除传送/死亡步。
+        if (self._warp_fwd_count == 3
+                and tag == "NORMAL"
+                and not terminated
+                and snap is not None
+                and snap.get("x_world", 0) > self._zone4_max_x):
+            new_ground = snap.get("x_world", 0) - self._zone4_max_x
+            bonus = new_ground * self._zone4_dx_bonus
+            reward += bonus
+            self._zone4_progress_total += bonus
+            info["zone4_progress_bonus"] = bonus
+
+        # ---- zone5 前进 shaping：第 4 次前传后（在 zone5）按新地段给分 ----
+        # zone5 x 为连续大值（从 ~4152 起递增），直接用 _max_x_ever 做 new-ground 基线
+        # （和 zone3 一样）；一路向右到终点旗杆，不封顶。只奖励 NORMAL 步。
+        if (self._warp_fwd_count >= 4
+                and tag == "NORMAL"
+                and not terminated
+                and snap is not None
+                and snap.get("x_world", 0) > self._max_x_ever):
+            new_ground = snap.get("x_world", 0) - self._max_x_ever
+            bonus = new_ground * self._zone5_dx_bonus
+            reward += bonus
+            self._zone5_progress_total += bonus
+            info["zone5_progress_bonus"] = bonus
+
+        # ---- zone5 火坑跨越引导 ----
+        if self._warp_fwd_count >= 4 and snap is not None:
+            x_now = snap.get("x_world", 0)
+            y_now = snap.get("y_pixel", 200)
+            # 火坑上方腾空：奖励跳跃弧。岩浆上方无法久留（落下即死）→ 不可 farm。
+            if (self._zone5_pit_x_min <= x_now <= self._zone5_pit_x_max
+                    and y_now < self._zone5_pit_air_y):
+                reward += self._zone5_pit_air_bonus
+                info["zone5_pit_air"] = True
+                info["zone5_pit_air_bonus"] = self._zone5_pit_air_bonus
+            # 跨坑落地：x 首次越过火坑右缘且存活 → 成功跨坑，一次性大奖励
+            if (not self._zone5_pit_cleared
+                    and x_now > self._zone5_pit_x_max
+                    and not terminated):
+                reward += self._zone5_pit_clear_bonus
+                self._zone5_pit_cleared = True
+                info["zone5_pit_clear"] = True
+                info["zone5_pit_clear_bonus"] = self._zone5_pit_clear_bonus
+
         # 更新 max_x_ever 用于下一步分类
         if snap is not None:
             self._max_x_ever = max(self._max_x_ever, snap.get("x_world", 0))
@@ -917,6 +1005,9 @@ class WarpEventWrapper(Wrapper):
             info["episode_zone3_progress_total"] = float(self._zone3_progress_total)
             info["episode_zone3_pipe_enter"] = 1 if self._zone3_pipe_enter_triggered else 0
             info["episode_zone4_max_x"] = self._zone4_max_x
+            info["episode_zone4_progress_total"] = float(self._zone4_progress_total)
+            info["episode_zone5_progress_total"] = float(self._zone5_progress_total)
+            info["episode_zone5_pit_cleared"] = 1 if self._zone5_pit_cleared else 0
 
         return obs, reward, terminated, truncated, info
 
@@ -986,6 +1077,13 @@ def make_env(env_id=None):
         zone3_pipe_x=ZONE3_PIPE_X,
         zone3_pipe_x_tol=ZONE3_PIPE_X_TOL,
         zone3_pipe_enter_bonus=ZONE3_PIPE_ENTER_BONUS,
+        zone4_dx_bonus=ZONE4_DX_BONUS,
+        zone5_dx_bonus=ZONE5_DX_BONUS,
+        zone5_pit_x_min=ZONE5_PIT_X_MIN,
+        zone5_pit_x_max=ZONE5_PIT_X_MAX,
+        zone5_pit_air_y=ZONE5_PIT_AIR_Y,
+        zone5_pit_air_bonus=ZONE5_PIT_AIR_BONUS,
+        zone5_pit_clear_bonus=ZONE5_PIT_CLEAR_BONUS,
     )
     env = Monitor(env)
     return env
@@ -1207,6 +1305,8 @@ class EpisodeLogCallback(BaseCallback):
                 z4mx = info.get("episode_zone4_max_x")
                 if z4mx:
                     extras.append("z4_max_x={}".format(int(z4mx)))
+                if info.get("episode_zone5_pit_cleared"):
+                    extras.append("z5_pit")
                 extras_s = ("  " + " ".join("[{}]".format(x) for x in extras)) if extras else ""
 
                 ec = getattr(self.model, "ent_coef", None)

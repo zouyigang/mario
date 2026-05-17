@@ -401,20 +401,33 @@ EVENT_COLORS = {
 }
 
 
-def _classify_step(curr_snap, prev_snap, action, prev_max_x_ever):
+def _area_key(snap):
+    """区域唯一标识：(area, area_type, foreground)。钻管道进入新地段时该三元组会变化。
+    注意：8-4 的 zone1 与 zone5 会共用同一三元组，故 NEW/REVISIT 还需配合 x_world 判定。"""
+    return (snap.get("area", 0), snap.get("area_type", 0), snap.get("foreground", 0))
+
+
+def _classify_step(curr_snap, prev_snap, action, prev_max_x_ever, visited_area_keys=None):
     """
-    返回 event tag。判别公式（与 HUD 描述一致）：
-      |Δx_world| ≤ NORMAL_DX                        → NORMAL
-      |Δx_world| 大 且 有管道信号                    → WARP_*；sign(Δx) 定方向，与 max_x_ever 比定 NEW/REVISIT
+    返回 event tag（与 train_sb3 的 _classify_step 保持一致）：
+      区域三元组(area,area_type,foreground)变化 且 有管道信号
+          → WARP_*；x_world 突破本局历史最远 → FWD_NEW，
+            否则按目标三元组是否到访过定 FWD_NEW / BACK_REVISIT
+      |Δx_world| ≤ NORMAL_DX 且 区域未变             → NORMAL
+      |Δx_world| 大 且 同区域内 且 有管道信号         → WARP_*；sign(Δx) 定方向
       |Δx_world| 大 且 无管道信号 且 |Δx_screen|<阈值 → COORD_WRAP（page byte 回卷，实际照常前进）
       其它                                          → BIG_JUMP
     管道信号：action==DOWN(10) 或 prev/curr state ∈ {0x02 进 L 管, 0x03 下管, 0x07 进入新区域}
+              或 区域三元组变化
     """
-    if prev_snap is None:
+    if prev_snap is None or curr_snap is None:
         return "INIT"
     dx = curr_snap.get("x_world", 0) - prev_snap.get("x_world", 0)
-    d_xs = curr_snap.get("x_screen", 0) - prev_snap.get("x_screen", 0)
-    if abs(dx) <= _NORMAL_DX:
+    curr_key = _area_key(curr_snap)
+    prev_key = _area_key(prev_snap)
+    area_changed = (curr_key != prev_key)
+
+    if abs(dx) <= _NORMAL_DX and not area_changed:
         return "NORMAL"
 
     is_down_action = (action == 10)
@@ -423,13 +436,23 @@ def _classify_step(curr_snap, prev_snap, action, prev_max_x_ever):
         is_down_action
         or prev_snap.get("player_state", 0) in pipe_states
         or curr_snap.get("player_state", 0) in pipe_states
+        or area_changed
     )
 
     if pipe_signal:
+        if area_changed:
+            visited = visited_area_keys or set()
+            # 优先用坐标判定：新区 x_world 突破本局历史最远 → 一定是前进到新地段。
+            # 必须放在 visited 判定之前 —— 8-4 的 zone1 与 zone5 共用同一三元组，
+            # 靠 visited 会把前进 zone5 误判成回传。
+            if curr_snap.get("x_world", 0) > prev_max_x_ever:
+                return "WARP_FWD_NEW"
+            return "WARP_FWD_NEW" if curr_key not in visited else "WARP_BACK_REVISIT"
         new_or_revisit = "NEW" if curr_snap.get("x_world", 0) > prev_max_x_ever else "REVISIT"
         return ("WARP_FWD_" if dx > 0 else "WARP_BACK_") + new_or_revisit
 
     # 没有管道信号但 x_world 巨变：典型 coord wrap（page 回卷）
+    d_xs = curr_snap.get("x_screen", 0) - prev_snap.get("x_screen", 0)
     if abs(d_xs) < _SCREEN_STAY:
         return "COORD_WRAP"
     return "BIG_JUMP"
@@ -775,11 +798,13 @@ def main():
             steps = 0
             prev_snap = None
             max_x_ever = 0   # 本局历史最大 x_world，用于 NEW vs REVISIT 判定
+            visited_area_keys = set()   # 本局已到访的区域三元组，用于区分前传新区/回传老区
 
             # 初始帧（step=0，便于看起点）
             init_rgb = _capture_rgb(gym_render)
             init_snap = _collect_ram_snapshot(smb_env)
             max_x_ever = max(max_x_ever, init_snap.get("x_world", 0))
+            visited_area_keys.add(_area_key(init_snap))
             buffer.append({
                 "step": 0,
                 "action": None,
@@ -825,11 +850,13 @@ def main():
                 # 事件 tag 优先取 WarpEventWrapper 注入的 info["event_tag"]（含 WRONG_LOOP_TIMEOUT 等
                 # 仅在 wrapper 内才能算出的状态机标签）；缺失时 fallback 用本地无状态分类器。
                 event_tag = info.get("event_tag") or _classify_step(
-                    snap, prev_snap, int(action), max_x_ever
+                    snap, prev_snap, int(action), max_x_ever, visited_area_keys
                 )
                 post_wrap_left = int(info.get("post_wrap_steps_left", 0) or 0)
                 # max_x_ever：直接累 max。COORD_WRAP 时 x_world 突降不会拉低；被回传时只是不增长。
                 max_x_ever = max(max_x_ever, snap.get("x_world", 0))
+                # 分类用完再登记当前区域三元组（与 train_sb3 的顺序一致）
+                visited_area_keys.add(_area_key(snap))
 
                 buffer.append({
                     "step": steps,
