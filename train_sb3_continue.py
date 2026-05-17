@@ -157,10 +157,13 @@ SPEED_BONUS_PER_STEP = 2
 WARP_DX_THRESHOLD = 30
 WARP_SCREEN_STAY = 32
 # 下错管道被回传 / 任何后传 / 未分类大跳变：本局立即终止 + 扣分
-# 必须 < DEATH_PENALTY_SEEN(=25)，否则模型对水管选择不确定时会理性选择自杀来 hedge：
-# 若 WARP_BACK_PENALTY=30 > DEATH=25，"100% 确信选错管道"的期望-30 比"自杀"-25 更差，
-# 模型会学到走到水管前先自杀。-10 让自杀严格最差，同时保留与 +20 的 2× 正向梯度。
+# 必须 < DEATH_PENALTY_SEEN(=40)，否则模型对水管选择不确定时会理性选择自杀来 hedge：
+# 若 WARP_BACK_PENALTY > DEATH，"100% 确信选错管道"的期望比"自杀"更差，模型会学到走到水管前先自杀。
+# WARP_BACK_NEW / BIG_JUMP / WRONG_LOOP_TIMEOUT 仍用 10。
 WARP_BACK_PENALTY = 10
+# 钻入已到访过的老地段（WARP_BACK_REVISIT）单独加重：模型把它当"安全出口"刷分（钻误管 -10 干净终局），
+# 提到 30 让这个出口明显变贵，配合 zone3 探索奖励提前，逼模型继续找正确水管。仍 < DEATH(=40) 不触发自杀对冲。
+WARP_BACK_REVISIT_PENALTY = 40
 # 下对管道前传到从未到达过的新地段：奖励分（鼓励选对水管）
 # 必须远大于 DEATH_PENALTY(25)，否则"前传后在新区域死一次"的净收益接近0，与普通死亡无法区分
 # +50 让正确管道期望值≈+106，vs 普通死亡≈+50，差距足够 PPO 学到梯度
@@ -222,14 +225,22 @@ ZONE2_POST_STAND_PIPE_Y_MAX = 65     # 水管上方 y 阈值（y 越小越高）
 ZONE2_POST_STAND_PIPE_BONUS = 80     # 到达水管上方一次性奖励
 
 # zone3 探索奖励：第二次 WARP_FWD_NEW 之后激活（zone2 出管 → 进入第三段图）
-# 目的：把 zone3 (x>3400) 未知区域的期望值从负翻正，避免模型选择"已知 WARP_BACK_REVISIT -10"作为安全出口
+# 目的：把 zone3 未知区域的期望值从负翻正，避免模型选择"已知 WARP_BACK_REVISIT -10"作为安全出口
 # 只在 tag==NORMAL 且 x_world 突破历史最远（new ground）时给，奖励 = (x - max(max_x_ever, ZONE3_X_MIN)) × ZONE3_DX_BONUS
 # new-ground-only 防御性收紧：来回走也不会净赚（往左走不到、再往右走的部分也不算新地段）
-ZONE3_X_MIN = 3400
-ZONE3_DX_BONUS = 0.3
+# X_MIN 必须 < 误管位置（x≈3395），否则模型在到达奖励区前就钻误管回传，探索奖励完全失效。
+# 设 3340：误管前留 ~55px 跑道，3395→正确水管 3640 段每步都有正奖励，使前进严格优于钻误管 -10。
+ZONE3_X_MIN = 3390
+ZONE3_DX_BONUS = 0.4
 # zone3 x 超限截断：zone3 激活后，若 Mario 的 x_world 超过此阈值，
 # 说明已错过钻水管时机进入重复路段，立即终止本局按死亡处理防止刷分
-ZONE3_X_MAX = 3660
+# 必须 > 正确水管 x(3660)，否则到达水管即越界、模型没有下钻窗口（跳帧 4 会一步冲过）。
+# z3_progress 已在水管 x 封顶，3660→3700 段无正奖励，不会刷分。
+ZONE3_X_MAX = 3700
+# zone3 正确水管：钻入即前传 zone4
+ZONE3_PIPE_X = 3660            # 正确水管 x_world 中心
+ZONE3_PIPE_X_TOL = 32          # 钻管判定的 x 容差（跳帧 4 下留足余量）
+ZONE3_PIPE_ENTER_BONUS = 80    # 在水管附近进入管道态的密集奖励（教模型按 DOWN 下钻）
 
 # 加载模型
 LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
@@ -521,6 +532,7 @@ class WarpEventWrapper(Wrapper):
 
     def __init__(self, env,
                  warp_back_penalty=WARP_BACK_PENALTY,
+                 warp_back_revisit_penalty=WARP_BACK_REVISIT_PENALTY,
                  warp_fwd_bonus=WARP_FWD_BONUS,
                  pipe_enter_bonus=PIPE_ENTER_BONUS,
                  wrong_loop_grace_steps=COORD_WRAP_GRACE_STEPS,
@@ -546,9 +558,13 @@ class WarpEventWrapper(Wrapper):
                  zone2_post_stand_pipe_bonus=ZONE2_POST_STAND_PIPE_BONUS,
                  zone3_x_min=ZONE3_X_MIN,
                  zone3_dx_bonus=ZONE3_DX_BONUS,
-                 zone3_x_max=ZONE3_X_MAX):
+                 zone3_x_max=ZONE3_X_MAX,
+                 zone3_pipe_x=ZONE3_PIPE_X,
+                 zone3_pipe_x_tol=ZONE3_PIPE_X_TOL,
+                 zone3_pipe_enter_bonus=ZONE3_PIPE_ENTER_BONUS):
         super().__init__(env)
         self._warp_back_penalty = float(warp_back_penalty)
+        self._warp_back_revisit_penalty = float(warp_back_revisit_penalty)
         self._warp_fwd_bonus = float(warp_fwd_bonus)
         self._pipe_enter_bonus = float(pipe_enter_bonus)
         self._wrong_loop_grace = int(wrong_loop_grace_steps)
@@ -575,6 +591,9 @@ class WarpEventWrapper(Wrapper):
         self._zone3_x_min = int(zone3_x_min)
         self._zone3_dx_bonus = float(zone3_dx_bonus)
         self._zone3_x_max = int(zone3_x_max)
+        self._zone3_pipe_x = int(zone3_pipe_x)
+        self._zone3_pipe_x_tol = int(zone3_pipe_x_tol)
+        self._zone3_pipe_enter_bonus = float(zone3_pipe_enter_bonus)
         self._prev_snap = None
         self._max_x_ever = 0
         self._warp_fwd_count = 0
@@ -601,6 +620,10 @@ class WarpEventWrapper(Wrapper):
         # zone3：第二次 WARP_FWD_NEW（zone2 出管）后激活
         self._zone3_active = False
         self._zone3_progress_total = 0.0
+        # zone3 钻管：在正确水管附近进入管道态时给一次密集奖励
+        self._zone3_pipe_enter_triggered = False
+        # zone4：第 3 次前传后进入，x 重新从小值开始，单独记录本局最远 x
+        self._zone4_max_x = 0
         # 本局已到访过的区域三元组集合，用于区分前传新区 / 回传老区
         self._visited_area_keys = set()
 
@@ -629,6 +652,8 @@ class WarpEventWrapper(Wrapper):
         self._zone2_post_stand_pipe_triggered = False
         self._zone3_active = False
         self._zone3_progress_total = 0.0
+        self._zone3_pipe_enter_triggered = False
+        self._zone4_max_x = 0
         return obs, info
 
     def step(self, action):
@@ -681,18 +706,33 @@ class WarpEventWrapper(Wrapper):
             info["warp_fwd"] = True
             info["warp_fwd_bonus"] = self._warp_fwd_bonus
             self._warp_fwd_count += 1
-            # 第一次前传成功 → 激活 zone2 高位探索奖励
-            # 再次前传成功（从 zone2 出来）→ 关闭 zone2
-            if not self._zone2_active:
+            # 按累计前传次数切换区域 shaping，避免第 3 次前传后 `not zone2_active`
+            # 把 zone2 错误地重新激活（旧逻辑只判 zone2_active 真假）。
+            #   1 次：进 zone2 → 激活 zone2  2 次：zone2 出管进 zone3 → 激活 zone3
+            #   3 次：zone3 出管钻入 zone4 → zone2/zone3 shaping 全部关闭
+            if self._warp_fwd_count == 1:
                 self._zone2_active = True
-            else:
+            elif self._warp_fwd_count == 2:
                 self._zone2_active = False
                 self._zone3_active = True
+            elif self._warp_fwd_count >= 3:
+                self._zone2_active = False
+                self._zone3_active = False
+                # 第 3 次前传 = 成功钻入 zone3→zone4 水管。下管动画与区域切换常在
+                # 同一跳帧步内完成，专门的 pipe-enter 块（要求 zone3 仍激活、区域未变）
+                # 抓不到中间步，故在此补发钻管奖励与标记（仅当此前未触发）。
+                if not self._zone3_pipe_enter_triggered:
+                    reward += self._zone3_pipe_enter_bonus
+                    self._zone3_pipe_enter_triggered = True
+                    info["zone3_pipe_enter"] = True
+                    info["zone3_pipe_enter_bonus"] = self._zone3_pipe_enter_bonus
         elif tag in ("WARP_BACK_REVISIT", "WARP_BACK_NEW", "BIG_JUMP", "WRONG_LOOP_TIMEOUT"):
-            reward -= self._warp_back_penalty
+            pen = (self._warp_back_revisit_penalty if tag == "WARP_BACK_REVISIT"
+                   else self._warp_back_penalty)
+            reward -= pen
             info["warp_back"] = True
             info["warp_back_tag"] = tag
-            info["warp_back_penalty"] = self._warp_back_penalty
+            info["warp_back_penalty"] = pen
             truncated = True
             if tag == "WRONG_LOOP_TIMEOUT":
                 self._wrong_loop_count += 1
@@ -809,17 +849,37 @@ class WarpEventWrapper(Wrapper):
         # ---- zone3 探索推进奖励：第二次前传后、突破历史最远 x 才给 ----
         # 只在 NORMAL 步、x>ZONE3_X_MIN 且 x>_max_x_ever（new ground）时累计；
         # 排除传送/COORD_WRAP/死亡步，且来回走也无法刷分（max_x_ever 单调递增）
+        # 关键：奖励 x 在正确水管 ZONE3_PIPE_X 处封顶 —— 走过水管不再给 progress，
+        # 否则模型会一路冲过水管刷分直到 ZONE3_X_MAX 越界（旧的局部最优）。
         if (self._zone3_active
                 and tag == "NORMAL"
                 and not terminated
                 and snap is not None
                 and snap.get("x_world", 0) > self._zone3_x_min
                 and snap.get("x_world", 0) > self._max_x_ever):
-            new_ground = snap.get("x_world", 0) - max(self._max_x_ever, self._zone3_x_min)
-            bonus = new_ground * self._zone3_dx_bonus
-            reward += bonus
-            self._zone3_progress_total += bonus
-            info["zone3_progress_bonus"] = bonus
+            x_cap = min(snap.get("x_world", 0), self._zone3_pipe_x)
+            new_ground = x_cap - max(self._max_x_ever, self._zone3_x_min)
+            if new_ground > 0:
+                bonus = new_ground * self._zone3_dx_bonus
+                reward += bonus
+                self._zone3_progress_total += bonus
+                info["zone3_progress_bonus"] = bonus
+
+        # ---- zone3 钻管密集奖励：在正确水管 x 附近首次进入管道态 → 立即给分 ----
+        # WARP_FWD_NEW +50 太稀疏，模型发现不了"按 DOWN 下钻"；这里在 player_state
+        # 进入管道态那一刻就给 ZONE3_PIPE_ENTER_BONUS，把"下钻动作"与奖励直接关联。
+        if (self._zone3_active
+                and not self._zone3_pipe_enter_triggered
+                and snap is not None
+                and self._prev_snap is not None
+                and abs(snap.get("x_world", 0) - self._zone3_pipe_x) <= self._zone3_pipe_x_tol):
+            prev_ps = self._prev_snap.get("player_state", -1)
+            curr_ps = snap.get("player_state", -1)
+            if curr_ps in _PIPE_STATES and prev_ps not in _PIPE_STATES:
+                reward += self._zone3_pipe_enter_bonus
+                self._zone3_pipe_enter_triggered = True
+                info["zone3_pipe_enter"] = True
+                info["zone3_pipe_enter_bonus"] = self._zone3_pipe_enter_bonus
 
         # ---- zone2 x 超限截断：防止走过隐藏格/水管区域后继续刷分 ----
         # 只要在 zone2 中且 x 超过阈值就截断
@@ -847,6 +907,9 @@ class WarpEventWrapper(Wrapper):
 
         if snap is not None:
             self._max_x_ever = max(self._max_x_ever, snap.get("x_world", 0))
+            # 进入 zone4（第 3 次前传后）单独记录最远 x —— zone4 的 x 从小值重新开始
+            if self._warp_fwd_count >= 3:
+                self._zone4_max_x = max(self._zone4_max_x, snap.get("x_world", 0))
             self._visited_area_keys.add(_area_key(snap))
             self._prev_snap = snap
 
@@ -859,6 +922,8 @@ class WarpEventWrapper(Wrapper):
             info["episode_zone2_block_stands"] = self._zone2_block_stand_count
             info["episode_zone2_post_stand_pipe"] = 1 if self._zone2_post_stand_pipe_triggered else 0
             info["episode_zone3_progress_total"] = float(self._zone3_progress_total)
+            info["episode_zone3_pipe_enter"] = 1 if self._zone3_pipe_enter_triggered else 0
+            info["episode_zone4_max_x"] = self._zone4_max_x
 
         return obs, reward, terminated, truncated, info
 
@@ -896,6 +961,7 @@ def make_env(env_id=None):
     env = WarpEventWrapper(
         env,
         warp_back_penalty=WARP_BACK_PENALTY,
+        warp_back_revisit_penalty=WARP_BACK_REVISIT_PENALTY,
         warp_fwd_bonus=WARP_FWD_BONUS,
         pipe_enter_bonus=PIPE_ENTER_BONUS,
         zone2_block_hit_bonus=ZONE2_BLOCK_HIT_BONUS,
@@ -921,6 +987,9 @@ def make_env(env_id=None):
         zone3_x_min=ZONE3_X_MIN,
         zone3_dx_bonus=ZONE3_DX_BONUS,
         zone3_x_max=ZONE3_X_MAX,
+        zone3_pipe_x=ZONE3_PIPE_X,
+        zone3_pipe_x_tol=ZONE3_PIPE_X_TOL,
+        zone3_pipe_enter_bonus=ZONE3_PIPE_ENTER_BONUS,
     )
     env = Monitor(env)
     return env
@@ -1135,9 +1204,12 @@ class EpisodeLogCallback(BaseCallback):
                 z2p = info.get("episode_zone2_post_stand_pipe")
                 if z2p:
                     extras.append("z2_pipe")
-                z3p = info.get("episode_zone3_progress_total", 0.0)
-                if z3p > 0:
-                    extras.append("z3+{:.1f}".format(float(z3p)))
+                z3pipe = info.get("episode_zone3_pipe_enter")
+                if z3pipe:
+                    extras.append("z3_pipe")
+                z4mx = info.get("episode_zone4_max_x")
+                if z4mx:
+                    extras.append("z4_max_x={}".format(int(z4mx)))
                 extras_s = ("  " + " ".join("[{}]".format(x) for x in extras)) if extras else ""
 
                 ec = getattr(self.model, "ent_coef", None)
