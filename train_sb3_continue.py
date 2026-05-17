@@ -495,6 +495,11 @@ def _classify_step(curr_snap, prev_snap, action, prev_max_x_ever, visited_area_k
     if pipe_signal:
         if area_changed:
             visited = visited_area_keys or set()
+            # 优先用坐标判定：新区 x_world 突破本局历史最远 → 一定是前进到新地段。
+            # 必须放在 visited 判定之前 —— 8-4 的 zone1 与 zone5 共用同一
+            # (area,area_type,foreground) 三元组，靠 visited 会把前进 zone5 误判成回传。
+            if curr_snap.get("x_world", 0) > prev_max_x_ever:
+                return "WARP_FWD_NEW"
             return "WARP_FWD_NEW" if curr_key not in visited else "WARP_BACK_REVISIT"
         new_or_revisit = "NEW" if curr_snap.get("x_world", 0) > prev_max_x_ever else "REVISIT"
         return ("WARP_FWD_" if dx > 0 else "WARP_BACK_") + new_or_revisit
@@ -907,8 +912,9 @@ class WarpEventWrapper(Wrapper):
 
         if snap is not None:
             self._max_x_ever = max(self._max_x_ever, snap.get("x_world", 0))
-            # 进入 zone4（第 3 次前传后）单独记录最远 x —— zone4 的 x 从小值重新开始
-            if self._warp_fwd_count >= 3:
+            # 进入 zone4（恰好第 3 次前传后）单独记录最远 x —— zone4 的 x 从小值重新开始；
+            # == 3 限定只统计 zone4，前进到 zone5（count 变 4）后不再混入 zone5 的 x
+            if self._warp_fwd_count == 3:
                 self._zone4_max_x = max(self._zone4_max_x, snap.get("x_world", 0))
             self._visited_area_keys.add(_area_key(snap))
             self._prev_snap = snap
