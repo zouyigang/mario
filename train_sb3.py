@@ -1,4 +1,4 @@
-# ======================
+﻿# ======================
 # 马里奥强化学习训练脚本（从头训练 · 激进版）
 # ======================
 # 用途：从零开始训练，不加载已有模型。超参数偏激进以加快探索与收敛。
@@ -144,12 +144,12 @@ from sb3_device import SB3_DEVICE
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-5-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
+MARIO_ENV_ID = "SuperMarioBros-4-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
 # 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
-NUM_ENVS = 24   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
+NUM_ENVS = 16   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
 USE_SUBPROC_VEC_ENV = True   # True=多进程真并行（更多 env 能加速）；False=DummyVecEnv（兼容性好，Windows/NES 更稳）
-FRAME_SKIP = 2               # 从 4 → 2，双倍时间精度，解决岔口起跳差1-2帧的问题
+FRAME_SKIP = 4               # 从 4 → 2，双倍时间精度，解决岔口起跳差1-2帧的问题
 FRAME_SIZE = 84
 FRAME_STACK = 4
 CLIP_REWARD = True   # True=每步奖励裁剪为 +1/0/-1（见下方奖励说明）
@@ -1571,7 +1571,6 @@ def main():
             verbose=0,
             device=SB3_DEVICE,
             tensorboard_log=os.path.join(SAVE_DIR, "tensorboard"),
-            policy_kwargs=dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])]),
         )
     else:
         model = DQN(
