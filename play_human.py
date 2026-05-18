@@ -1,19 +1,26 @@
 # ======================
-# 人工键盘操控马里奥，并实时显示世界坐标 x 与奖励（与 train_sb3.make_env 一致）
+# 人工键盘操控马里奥（与 play_sb3.py 一致的单窗口面板显示）
 # ======================
 # 运行: python play_human.py
-# Windows：用 GetAsyncKeyState 读键，游戏窗口可有焦点；其它系统需: pip install pygame 并聚焦 pygame 提示窗口。
-# 键位（与 SIMPLE_MOVEMENT 一致）：←/A 向左，→/D 向右，空格/W 跳，右+跳=向右跳；Shift+右=加速跑，Shift+右+跳=跑跳
+# Windows：用 GetAsyncKeyState 全局读键，单窗口（左侧游戏画面 + 右侧信息面板）。
+# 其它系统：pip install pygame，并聚焦 pygame 弹出的小窗口接收按键。
+#
+# 键位（与 SIMPLE_MOVEMENT 一致）：
+#   ←/A 向左；→/D 向右；空格/W/↑ 跳；右+跳=向右跳
+#   Shift+右=加速跑；Shift+右+跳=跑跳
+#   Q/Esc 退出（游戏窗口聚焦时也可用）
 
 import os
 import sys
 import io
 import time
 import platform
+from collections import deque
 
 import numpy as np
 import cv2
 
+# 屏蔽旧版 gym 的弃用提示
 _stdout_orig, _stderr_orig = sys.stdout, sys.stderr
 sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
 try:
@@ -21,12 +28,37 @@ try:
 finally:
     sys.stdout, sys.stderr = _stdout_orig, _stderr_orig
 
-from train_sb3 import make_env, MOVEMENT_ACTIONS, _get_mario_x_from_env
+from train_sb3 import (
+    make_env,
+    MOVEMENT_ACTIONS,
+    _get_mario_x_from_env,
+    _get_mario_y_from_env,
+)
 
-# 演示关卡（与 play_sb3 类似，可改 v3 等与训练一致）
+# 复用 play_sb3 的面板渲染 / 帧合成 / 累计统计 / 事件日志
+from play_sb3 import (
+    _render_panel,
+    _compose_window,
+    _capture_rgb,
+    _new_totals,
+    _update_totals,
+    _collect_event_lines,
+    GAME_SCALE,
+)
+
+# ======================
+# 配置
+# ======================
 PLAY_ENV_ID = "SuperMarioBros-4-4-v1"
 FRAME_DELAY_SEC = 0.06
-HUD_WIN = "Human play — x / reward"
+WINDOW_NAME = "Mario Human Play"
+
+# 替换面板底部的控制说明（替换 play_sb3 的回放键说明）
+HELP_LINES = [
+    "<-/A left   ->/D right   Space/W/Up jump",
+    "Shift+-> run            Shift+->+jump runjump",
+    "[Q/Esc] quit",
+]
 
 
 def _unwrap_to_gym_render(env):
@@ -38,7 +70,9 @@ def _unwrap_to_gym_render(env):
     return None
 
 
-# ---------- 键盘：Windows 全局 ----------
+# ======================
+# 键盘输入
+# ======================
 if platform.system() == "Windows":
     import ctypes
 
@@ -78,6 +112,9 @@ if platform.system() == "Windows":
         if jump:
             return 5
         return 0
+
+    def quit_pressed_global() -> bool:
+        return _async_down(VK["Q"])
 
 else:
     _pg_inited = False
@@ -119,11 +156,14 @@ else:
             return 5
         return 0
 
+    def quit_pressed_global() -> bool:
+        return False
 
+
+# ======================
+# 终局原因（与 train_sb3.EpisodeLogCallback 判定优先级一致）
+# ======================
 def _format_episode_exit_reason(terminated, truncated, info):
-    """
-    与 train_sb3.EpisodeLogCallback 判定优先级一致，并补充 Gym 状态与其它 info。
-    """
     if info.get("dead_loop"):
         tag = "循环超时（死循环检测：长时间横向无足够进展）"
     elif info.get("flag_get"):
@@ -141,10 +181,7 @@ def _format_episode_exit_reason(terminated, truncated, info):
     else:
         tag = "未知"
 
-    parts = [
-        tag,
-        "terminated={} truncated={}".format(terminated, truncated),
-    ]
+    parts = [tag, "terminated={} truncated={}".format(terminated, truncated)]
     mx = info.get("episode_max_x")
     if mx is not None:
         parts.append("MaxX={}".format(mx))
@@ -160,129 +197,113 @@ def _format_episode_exit_reason(terminated, truncated, info):
     return " | ".join(parts)
 
 
-def _hud_flag_lines(info):
-    """当前步 info 里与训练相关的标记（最后一帧可对照退出原因）。"""
-    lines = []
-    if info.get("flag_get"):
-        lines.append("flag_get")
-    if info.get("dead_loop"):
-        lines.append("dead_loop")
-    if info.get("teleport_branch"):
-        lines.append(
-            "teleport_branch ws={}".format(info.get("wrong_branch_steps", ""))
-        )
-    if info.get("teleport_immediate"):
-        lines.append("teleport_immediate")
-    if info.get("correct_wrap_new_area"):
-        lines.append("correct_wrap_new_area")
-    if info.get("coordinate_wrap"):
-        lines.append("coordinate_wrap")
-    if info.get("no_progress"):
-        lines.append("no_progress")
-    return lines
-
-
-def _draw_hud(x: int, step_r: float, total_r: float, action: int, lines_extra=None):
-    base_h = 140
-    line_h = 22
-    extra_n = len(lines_extra) if lines_extra else 0
-    h = min(base_h + max(0, extra_n - 2) * line_h, 260)
-    w = 520
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-    img[:] = (40, 40, 40)
-    name = (
-        MOVEMENT_ACTIONS[action] if 0 <= action < len(MOVEMENT_ACTIONS) else ["?"]
-    )
-    name_s = "+".join(name) if name else "NOOP"
-    texts = [
-        "x (world): {}".format(x),
-        "step reward: {:.4f}".format(step_r),
-        "episode total: {:.2f}".format(total_r),
-        "action {}: {}".format(action, name_s),
-    ]
-    if lines_extra:
-        texts.extend(lines_extra)
-    y = 22
-    for t in texts:
-        cv2.putText(
-            img,
-            t,
-            (10, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 200),
-            1,
-            cv2.LINE_AA,
-        )
-        y += 26
-    cv2.imshow(HUD_WIN, img)
-    cv2.waitKey(1)
-
-
+# ======================
+# 主循环
+# ======================
 def main():
     print("人工操控模式 | 关卡: {}".format(PLAY_ENV_ID))
-    print("键位: ←A 左 →D 右 | 空格/W 跳 | Shift+右 跑 | Q(仅 pygame 模式) 退出")
+    print("键位: ←A 左 →D 右 | 空格/W/↑ 跳 | Shift+右 跑 | Q 退出")
     print("奖励与裁剪与 train_sb3.make_env 一致（含 Clip、过关奖励等）。")
     print("-" * 50)
 
     env = make_env(PLAY_ENV_ID)
-    gym_render = _unwrap_to_gym_render(env)
+    inner_env = _unwrap_to_gym_render(env) or env
 
-    obs, info = env.reset()
-    total_r = 0.0
-    steps = 0
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
-    try:
-        while True:
-            if platform.system() == "Windows" and _async_down(VK["Q"]):
+    episode = 0
+    quit_all = False
+
+    while not quit_all:
+        episode += 1
+        reset_out = env.reset()
+        obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
+
+        totals = _new_totals()
+        event_log = deque(maxlen=20)
+        total_reward = 0.0
+        step_idx = 0
+        done = False
+        last_terminated = False
+        last_truncated = False
+        last_info = {}
+
+        # 初始一帧
+        x = _get_mario_x_from_env(env)
+        y = _get_mario_y_from_env(env)
+        rgb = _capture_rgb(inner_env)
+        game_h_px = (rgb.shape[0] if rgb is not None else 240) * GAME_SCALE
+        panel = _render_panel(
+            panel_h=game_h_px, info={}, action=None,
+            reward=0.0, total_reward=0.0,
+            episode=episode, step_idx=0,
+            buf_pos=0, buf_len=1, live_idx=0,
+            paused=False, frame_delay=FRAME_DELAY_SEC,
+            x=x, y=y, totals=totals, last_event_log=event_log,
+            help_lines=HELP_LINES,
+        )
+        cv2.imshow(WINDOW_NAME, _compose_window(rgb, panel))
+        cv2.waitKey(1)
+
+        while not done and not quit_all:
+            if quit_pressed_global():
                 print("已按 Q 退出")
+                quit_all = True
                 break
 
             action = read_action_index()
-            obs, reward, terminated, truncated, info = env.step(action)
-            steps += 1
+            step_out = env.step(action)
+            if len(step_out) == 5:
+                obs, reward, terminated, truncated, info = step_out
+                done = bool(terminated or truncated)
+            else:
+                obs, reward, done, info = step_out
+                terminated, truncated = done, False
+            step_idx += 1
             r = float(reward)
-            total_r += r
+            total_reward += r
+            _update_totals(totals, info)
+            for line in _collect_event_lines(step_idx, info, r):
+                event_log.append(line)
+            last_terminated, last_truncated, last_info = terminated, truncated, info
 
             x = _get_mario_x_from_env(env)
-            flag_lines = _hud_flag_lines(info)
-            _draw_hud(x, r, total_r, int(action), flag_lines if flag_lines else None)
+            y = _get_mario_y_from_env(env)
+            rgb = _capture_rgb(inner_env)
+            game_h_px = (rgb.shape[0] if rgb is not None else 240) * GAME_SCALE
+            panel = _render_panel(
+                panel_h=game_h_px, info=info, action=int(action),
+                reward=r, total_reward=total_reward,
+                episode=episode, step_idx=step_idx,
+                buf_pos=0, buf_len=1, live_idx=0,
+                paused=False, frame_delay=FRAME_DELAY_SEC,
+                x=x, y=y, totals=totals, last_event_log=event_log,
+                help_lines=HELP_LINES,
+            )
+            cv2.imshow(WINDOW_NAME, _compose_window(rgb, panel))
 
-            if gym_render is not None:
-                try:
-                    gym_render.render(mode="human")
-                except Exception:
-                    pass
+            wait_ms = max(1, int(FRAME_DELAY_SEC * 1000))
+            key = cv2.waitKey(wait_ms)
+            if key != -1:
+                k = key & 0xFF
+                if k in (ord('q'), ord('Q'), 27):
+                    quit_all = True
+                    break
 
-            if FRAME_DELAY_SEC > 0:
-                time.sleep(min(float(FRAME_DELAY_SEC), 0.2))
+        if done and not quit_all:
+            reason = _format_episode_exit_reason(last_terminated, last_truncated, last_info)
+            print("EP {} 结束 | 步数: {} | 总奖励: {:.2f}\n  原因: {}".format(
+                episode, step_idx, total_reward, reason))
 
-            if terminated or truncated:
-                reason = _format_episode_exit_reason(terminated, truncated, info)
-                print(
-                    "本局结束 | 步数: {} | 总奖励: {:.2f}\n  原因: {}".format(
-                        steps,
-                        total_r,
-                        reason,
-                    )
-                )
-                obs, info = env.reset()
-                total_r = 0.0
-                steps = 0
-    finally:
-        env.close()
+    cv2.destroyAllWindows()
+    env.close()
+    if platform.system() != "Windows":
         try:
-            cv2.destroyWindow(HUD_WIN)
+            import pygame
+            pygame.quit()
         except Exception:
-            cv2.destroyAllWindows()
-        if platform.system() != "Windows":
-            try:
-                import pygame
-
-                pygame.quit()
-            except Exception:
-                pass
-        print("已关闭环境。")
+            pass
+    print("已关闭环境。")
 
 
 if __name__ == "__main__":

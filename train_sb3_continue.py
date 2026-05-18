@@ -1,10 +1,9 @@
 ﻿# ======================
-# 马里奥强化学习训练脚本（接着训练 · 保守版）
+# 马里奥强化学习训练脚本（接着训练）
 # ======================
-# 用途：加载已有 best/checkpoint 在此基础上继续训练。超参数偏保守，降低学习率、减少探索，避免后期崩。
-# 运行: python train_sb3_continue.py（需先有 sb3_mario_logs/best/best_model.zip 或指定 LOAD_CHECKPOINT）
+# 用途：加载已有 best/checkpoint 在此基础上继续训练（可换关卡）。
+# 运行: python train_sb3_continue.py（需先有 sb3_mario_logs/best/best_model.zip）
 # 从头训练请使用: python train_sb3.py
-# 依赖：gymnasium, stable-baselines3, gym-super-mario-bros, shimmy, nes_py, opencv-python
 
 import os
 import sys
@@ -23,11 +22,9 @@ warnings.filterwarnings("ignore", module="gym.*")
 warnings.filterwarnings("ignore", message=".*bool8.*")
 warnings.filterwarnings("ignore", message=".*step API.*")
 warnings.filterwarnings("ignore", message=".*one bool instead of two.*")
-# 屏蔽 gym 旧 API / np.bool8 等弃用提示（来自 gym_super_mario_bros 依赖的 gym）
 logging.getLogger("gym").setLevel(logging.ERROR)
 logging.getLogger("gym.utils").setLevel(logging.ERROR)
 
-# 导入 gym 时屏蔽其 “Gym has been unmaintained” 的 print，并关闭 passive_env_checker 的弃用提示
 _stdout_orig = sys.stdout
 _stderr_orig = sys.stderr
 sys.stdout = io.StringIO()
@@ -43,9 +40,6 @@ try:
 except Exception:
     pass
 
-# ======================
-# NumPy 版本检查：SB3/matplotlib 等依赖的 C 扩展在 NumPy 2.x 下会报错
-# ======================
 def _check_numpy():
     try:
         import numpy as np
@@ -62,16 +56,10 @@ def _check_numpy():
 
 _check_numpy()
 
-# ======================
-# NumPy 1.x 兼容性补丁（与 gym-super-mario-bros / nes_py 兼容）
-# ======================
 import numpy as np
 if not hasattr(np, "bool8"):
     np.bool8 = np.bool_
 
-# ======================
-# 可选：nes_py / gym_super_mario_bros 溢出补丁（若报错再启用）
-# ======================
 def _apply_nes_patches():
     try:
         import nes_py._rom as rom_module
@@ -125,198 +113,85 @@ import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT, SIMPLE_MOVEMENT, RIGHT_ONLY
 from nes_py.wrappers import JoypadSpace
 
-# SB3 图像预处理与帧堆叠（不依赖 gymnasium 的 FrameStack）
-from stable_baselines3.common.atari_wrappers import WarpFrame, MaxAndSkipEnv, ClipRewardEnv
+from stable_baselines3.common.atari_wrappers import WarpFrame, MaxAndSkipEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFrameStack
 
-# 算法与回调
-from stable_baselines3 import DQN, PPO
+from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
-
-from sb3_episode_log import EpisodeLogCallback, print_episode_log_banner
 from stable_baselines3.common.utils import get_linear_fn
-from sb3_device import SB3_DEVICE
 
-from teleport_detector import TeleportBackDetector
-
-# Gymnasium 包装器基类（用于自定义 wrapper）
 from gymnasium import Wrapper
 
 # ======================
 # 超参数
 # ======================
-MARIO_ENV_ID = "SuperMarioBros-4-4-v1"   # 训练 1-2 关；可改为 1-1, 2-1 等
-# 动作集：RIGHT_ONLY(5)=仅向右；SIMPLE_MOVEMENT(7)=+原地跳+向左；COMPLEX_MOVEMENT(12)=+向左跳/跑+下蹲+向上。多数关卡用 SIMPLE 即可；COMPLEX 探索慢
+MARIO_ENV_ID = "SuperMarioBros-4-4-v1"   # 目标关卡
 MOVEMENT_ACTIONS = SIMPLE_MOVEMENT
-NUM_ENVS = 16   # PPO 并行环境数。用 DummyVecEnv 时 env 顺序执行，改大反而更慢，建议 8；用 SubprocVecEnv 时可改为 16
-USE_SUBPROC_VEC_ENV = True   # True=多进程真并行（更多 env 能加速）；False=DummyVecEnv（兼容性好，Windows/NES 更稳）
-FRAME_SKIP = 4               # 从 4 → 2，双倍时间精度，解决岔口起跳差1-2帧的问题
+NUM_ENVS = 16
+USE_SUBPROC_VEC_ENV = True
+FRAME_SKIP = 4
 FRAME_SIZE = 84
 FRAME_STACK = 4
-CLIP_REWARD = True   # True=每步奖励裁剪为 +1/0/-1（见下方奖励说明）
-# 死亡那步不裁剪，保留明显负值让智能体更好学到「避免死亡」
-CLIP_REWARD_EXCEPT_DEATH = True   # True=死亡步不裁剪，用 DEATH_PENALTY_SEEN；False=与普通步一样裁成 -1
-# 注意：THRESHOLD 是「判定死亡」用：原始 reward <= 此值才视为死亡步。环境里死亡步约 -25，故必须 >= -25（如 -15）
-DEATH_REWARD_THRESHOLD = -15      # 原始 reward <= 此值视为死亡步（勿设成 -300，否则 -25 永远不触发）
-# v6：与超时统一为 100，消除"求死"套利空间
-DEATH_PENALTY_SEEN = 100
-# 接着训：要加载的模型路径；可改为 checkpoints/mario_XXX_steps.zip 指定某一轮
-LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
-# 本轮再训练的步数
-# v4：旧 best 在新 reward 下变成大负分，被污染的 value function 重学需要时间
-ADDITIONAL_TIMESTEPS = 8_000_000
-# 加载后覆盖到模型上的熵系数与学习率（v4：临时拉高熵迫使打破"错路farm"局部最优）
-ENT_COEF_CONTINUE = 0.015  # v9.0：0.03→0.015（=新 DYN_ENT_MIN），巩固模式从更低起步，充分利用 best 已学策略
-# 动态熵系数（DynamicEntCoefCallback）
-DYN_ENT_ENABLED = True
-DYN_ENT_MIN = 0.015            # v9.0：0.03→0.015，允许真正"低探索"模式（已会通关时不再强制乱试）
-DYN_ENT_MAX = 0.04             # v9.0：0.06→0.04，停滞时也不 panic 拉高熵
-DYN_ENT_EVAL_INTERVAL = 200_000  # v9.0：100k→200k，看更长窗口，避免被短期波动误判
-DYN_ENT_FAST_THRESHOLD = 15.0  # v9.0：30→15，降熵门槛降低，更容易进入"巩固降熵"模式
-DYN_ENT_SLOW_THRESHOLD = 2.0   # v9.0：5→2，仅在 reward 真死才升熵；否则信任当前策略
-DYN_ENT_ADJUST_SPEED = 0.05    # v9.0：0.10→0.05，EMA 更平滑，几乎不会出现一窗口大跳
-LR_CONTINUE = 1e-4              # v9.0：3e-4→1e-4，3x 降；过大 LR 让策略在"会通关"和"乱探索"间摆动
-LR_CONTINUE_END = 1e-5          # v9.0：5e-5→1e-5，末期更小更新，固化策略
-USE_LR_DECAY_CONTINUE = True   # True=学习率从 LR_CONTINUE 线性降到 LR_CONTINUE_END
-LR_CONTINUE_DECAY_END_FRACTION = 1.0  # 学习率在继续训练进度的多少比例内衰减到末值；必须 > 0
-ALGORITHM = "PPO"   # 须与 checkpoint 保存时的算法一致（"PPO" 或 "DQN"）
-# 继续训时也沿用与从头训一致的 PPO 超参，利于收敛、少抖（加载后覆盖到模型上）
-PPO_N_STEPS = 1024              # frame_skip 2 下步数翻倍，需更长 rollout 覆盖到分支点
-PPO_BATCH_SIZE = 1024
-PPO_N_EPOCHS = 3                # v9.0：4→3，每批数据少学一轮，减小过拟合最近 rollout
-PPO_CLIP_RANGE = 0.15           # v9.0：0.25→0.15，收紧策略更新幅度，单步漂移变小
-# 早停：当 rollout 平均奖励相对「历史最高」明显下降时提前结束，保留峰值附近的策略
-EARLY_STOP_ENABLED = False   # 保守版默认开启，防止接着训太久导致分数崩盘
-EARLY_STOP_RATIO = 0.90     # 保守：0.90 稍宽松，避免轻微波动就停
-EARLY_STOP_PATIENCE = 4     # 连续 4 次「下降」再停，比激进版稍宽容
-SAVE_DIR = "./sb3_mario_logs"
-# 看训练趋势图：在项目目录执行 tensorboard --logdir=sb3_mario_logs/tensorboard ，浏览器打开 http://localhost:6006
-# TensorBoard 里：rollout=训练时采样的数据统计，eval=定期用确定性策略单独评估的统计（通常比 rollout 低、更稳）
-MODEL_SAVE_PATH = "./sb3_mario_model"
-EVAL_FREQ = 20_000            # 评估间隔（步）；旧值 10000//4=2500 步就评一次，太频繁
-CHECKPOINT_FREQ = 50_000
-# 训练时是否显示游戏窗口（True=每步渲染，会变慢；可改为整数 N 表示每 N 步渲染一次）
-RENDER_WHILE_TRAINING = False  # 正式训练关闭渲染，速度快数倍；调试时改为 4 或 True
-# 渲染后延迟（秒），放慢动画便于和日志一起看；0=不延迟（最快）
-# 注意：>0 时会拉长训练真实时间；要最快训练请设 RENDER_WHILE_TRAINING=False 或本项=0
-RENDER_DELAY_SEC = 0   # 约 25 帧/秒；调大更慢（如 0.08）、调小更快（如 0.02）
-# 死循环检测：4-4 试管道时 x 可能久不动，略放宽避免过早 truncated
-DEAD_LOOP_STEPS = 1200   # frame_skip 2→步数×2；原 600
+
+# 奖励：与 train_sb3.py 完全一致
+DEATH_PENALTY_SEEN = 50
+FLAG_GET_BONUS = 50
+STEP_PENALTY_SEEN = 0.1       # 普通步小惩罚；向右正常推进应为正分，停顿/慢蹭仍亏分
+
+# 死循环检测
+DEAD_LOOP_STEPS = 500
 DEAD_LOOP_MIN_DX = 8
-# 死循环截断时智能体看到的惩罚（探索超时大额惩罚，必须 > 死亡惩罚以使"原地循环"成为最差选择）
-# v6：与死亡统一为 100，消除"求死"套利空间
-DEAD_LOOP_PENALTY_SEEN = 100  # 与 train_sb3 保持一致
-# DeadLoopDetector 现在只负责检测 + 设 truncated，不修改原始 reward
-DEAD_LOOP_PENALTY = 0    # 改为 0，惩罚统一在 ClipReward 层处理，避免被 MaxAndSkip 累加后误触死亡阈值
-# ======================
-# 通关奖励（基础 + 时间加权），与 train_sb3 保持一致
-# ======================
-FLAG_BASE_BONUS = 80             # v9.1：150→80，通关奖占比仍近半(~49%)，进一步降方差，让通关是"锦上添花"而非决定胜负
-FLAG_TIME_REF_STEPS = 4500
-FLAG_TIME_PER_STEP = 0.015       # v9.1：0.025→0.015，配合 BASE→80，预计 flag_total ≈ 80+0.015×630 ≈ 170，占比降到 ~30%
-FLAG_GET_BONUS = FLAG_BASE_BONUS  # 兼容旧引用
-# 迷宫探路时横向位移常小：过重会逼智能体送死重开；宜轻罚或仅作防刷分信号
-NO_PROGRESS_PENALTY_AFTER = 96   # frame_skip 2→步数×2；原 48
-NO_PROGRESS_MIN_DX_IN_WINDOW = 24 # 略放宽；过小仍易在直线关尾误判，可按关卡再调
-NO_PROGRESS_PENALTY_SEEN = 0.1   # frame_skip 2→每步惩罚÷2；原 0.2，步数翻倍后总惩罚不变
-# 步数惩罚过重时，长局探索总回报会低于短局送死
-STEP_PENALTY_SEEN = 0.01         # frame_skip 2→每步惩罚÷2；原 0.02
-# 回传检测参数（TeleportBackDetector 仅检测 + 设 info，惩罚统一在 ClipReward 层处理）
-ENABLE_TELEPORT_DETECTION = True   # 是否启用回传检测
-TELEPORT_MAX_X_HISTORY = 1000      # frame_skip 2→步数×2；原 500
-TELEPORT_IMMEDIATE_DX = 100        # 立即回传最小后退像素
-TELEPORT_IMMEDIATE_STEPS = 6       # frame_skip 2→步数×2；原 3
-TELEPORT_BRANCH_MIN_DISTANCE = 50  # 分支回传：回退到至少多少步前的位置
-TELEPORT_BRANCH_TOLERANCE = 20     # 分支回传位置容差（像素）
-TELEPORT_BRANCH_RELAX_TOLERANCE = 80
-TELEPORT_BRANCH_LARGE_JUMP_MIN_DELTA = 250
-TELEPORT_FRAME_SIM_THRESHOLD = 0.12
-TELEPORT_WRAP_PREV_X_MIN = 900
-TELEPORT_WRAP_CURR_X_MAX = 320
-BACKTRACK_GRACE_STEPS = 4          # frame_skip 2→步数×2；原 2
-BACKTRACK_SINGLE_STEP_MAX = 200    # 像素值，不需要翻倍
-# 回传惩罚参数（与 train_sb3 一致：固定大额惩罚，不 clawback 已得探索分）
-TELEPORT_IMMEDIATE_PENALTY = 50
-TELEPORT_BRANCH_BASE_PENALTY = 50
-WRONG_BRANCH_STEP_CLAWBACK = 0.0
-MAX_CLAWBACK = 0.0
-CORRECT_WRAP_BONUS = 0.0            # v8：暂关——correct_wrap_new_area 当前在检测器里恒 False，留下来是摆设
-# 回传 Replay 录制（用于人工回看判断检测是否准确）
-SAVE_TELEPORT_REPLAYS = False                                   # 是否保存回传 episode 的原始画面
-TELEPORT_REPLAY_DIR = "./sb3_mario_logs/teleport_replays"       # replay 保存目录
-TELEPORT_REPLAY_MAX_COUNT = 50                                  # 最多保留多少条 replay（超出后删最旧的）
+DEAD_LOOP_PENALTY_SEEN = 80
 
-# 迷宫模式（maze_reward_patch_v2）
-MAZE_MODE = True           # True = 迷宫模式；False = 原直线模式，行为不变
+# 7-4 分支回传检测：x 相对本局 max_x 明显骤降，视为走错分支并立即结束本局
+WARP_BACK_MIN_DROP = 96
+WARP_BACK_PENALTY_SEEN = 20
 
-# ======================
-# 奖励函数重构（v3，按"奖励函数重构方案"实现，与 train_sb3.py 完全一致）
-# 核心层级：快速通关 > 慢速通关 > 死亡/回传(多探索) > 死亡/回传(少探索) > 原地循环不动
-# ======================
+# 7-4 分支里程碑（PBRS）：首次到达列表中的 (x, y) 点附近时发一次正奖励
+# 用途：通关只在最后给信号，分支判断收不到局部反馈；这里给"刚选对了第 k 个分支"提供即时信号
+# 调参：手动观察 7-4，把每个正确分支后的稳定 (x, y) 坐标列入此列表（按 x 递增顺序）
+#       y 是马里奥纵坐标（NES：值越小越靠上），MILESTONE_Y_TOLERANCE 控制纵向容差像素
+# 触发条件：max_x_seen >= x_target 且 |current_y - y_target| <= MILESTONE_Y_TOLERANCE
+# 实现：按顺序累计单调递增，到达同一里程碑不重复发；穿透 MaxAndSkipEnv 也能完整保留
+MILESTONE_POINTS = [(285, 64), (1230, 128), (1576, 128), (1518, 176), (1590, 64), (1910, 64), (2000, 128), (2120, 64), (2500, 128)]
+MILESTONE_Y_TOLERANCE = 8
+MILESTONE_BONUS = 80.0
 
-# ---- 格子探索（v4：sqrt 衰减，无全局封顶，区分探索多少）----
-CELL_SIZE = 16             # 格子大小（像素）
-CELL_VISIT_BONUS = 3.5     # v6：2.5 → 3.5，加强前期探索信号
-CELL_BONUS_EPISODE_CAP = 1e9  # 本局所有 cell bonus 累计上限（设为极大值，实际无上限，以便区分探索多少）
-ENV_REWARD_SCALE = 0.1     # v8：0.4→0.1，迷宫关需绕路时不能让"向右天然爽"主导策略
-CELL_REVISIT_REWARD = 0.0  # 重复进入同一格 → 无奖无罚（按方案要求）
-MAZE_STALL_PENALTY = 0.0   # 关闭"同格停留"扣分；统一由"无新探索"持续扣分接管
-MAZE_STALL_ESCALATE_PER_STEP = 0.0
-MAZE_STALL_ESCALATE_CAP = 0.0
-FRONTIER_BONUS = 0.1       # v4：从 0.3 → 0.1，避免在边界来回踱步 farm
-# ---- 纵向探索奖励（v4：关闭，关卡先验不通用）----
-Y_LAYER_BONUS = 5           # v8：20→5，避免"到新层"信号盖过"在新层先往哪走"
-Y_LAYER_SIZE = 24            # 平台高差阈值（像素）：起跳前 y 与落地 y 之差 ≥ 该值才算到达新层；同时作为落点去重桶 y 粒度
-Y_LAYER_X_BUCKET = 256       # v8.6：32→256（一屏宽），防止同一物理平台横跨多个 x bucket 被反复奖励的漏洞
-Y_LAYER_CONFIRM_DX = 96      # 延迟确认：落到新 y_layer 后必须在下层贴地横向覆盖 ≥ 该值才发奖，防止"跳下去没探索又跳回来"薅分
+# 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
+# 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
+# BASE 要大于「该关正常快通步数 + 可能出现的蹭分步数」，否则快通已贴顶、蹭分只靠多走 +1 会反超
+SPEED_BONUS_BASE_STEPS = 600
+SPEED_BONUS_PER_STEP = 2
 
-# ---- 无新探索：v4 缩短到 2 秒触发持续扣分 ----
-# frame_skip=2，~30 step/s → 2 秒 ≈ 60 步
-MAZE_NO_NEW_CELL_STEPS = 30      # v6：60 → 40，更快进入扣分
-MAZE_NO_PROGRESS_PENALTY = 0.8   # v6：0.5 → 0.8，基础扣分加大
-MAZE_NO_PROGRESS_ESCALATE = 0.01   # v6：0.005 → 0.01，升级更快
-MAZE_NO_PROGRESS_ESCALATE_CAP = 2.0  # v6：1.5 → 2.0
+# 加载模型
+LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
+ADDITIONAL_TIMESTEPS = 10_000_000
 
-# ---- 无新探索：15 秒强制终止 + 大额惩罚（15 秒 ≈ 450 步）----
-MAZE_DEAD_LOOP_STEPS = 80        # v6：250 → 150，缩短无效episode
-DEAD_LOOP_PENALTY_OVERRIDE = 100  # v6：与死亡统一为 100
+# 接着训的 PPO 超参（比从头训稍保守）
+ENT_COEF_CONTINUE = 0.02
+# 自适应熵回调里 ent_coef 的上限；7 动作空间 0.2 会把 logits 抹平导致策略崩塌
+ENT_COEF_MAX = 0.12
+LR_CONTINUE = 1e-4
+LR_CONTINUE_END = 1e-5
+USE_LR_DECAY_CONTINUE = True
+PPO_N_STEPS = 512
+PPO_BATCH_SIZE = 256
+PPO_N_EPOCHS = 4
+PPO_CLIP_RANGE = 0.2
+GAMMA = 0.99
 
-# ---- 步数惩罚（迷宫模式建议关闭）----
-MAZE_STEP_PENALTY_SEEN = 0.0
-
-# ---- 回传检测宽松化（迷宫模式）----
-MAZE_BACKTRACK_GRACE_STEPS = 40    # frame_skip 2→步数×2；原 20
-MAZE_BACKTRACK_SINGLE_STEP_MAX = 400  # 像素值，不需要翻倍
-
-# ---- 战略性后退激励（v7：解决"不往回走"问题）----
-STRATEGIC_BACKTRACK_ENABLED = True       # 是否启用战略性后退奖励
-BACKTRACK_THRESHOLD = 8                   # v8：20→8，分叉口最初几步就接管
-BACKTRACK_NEW_CELL_BONUS = 1.0            # v8：2.5→1.0，弱化过程奖励，重心放到 success
-BACKTRACK_SUCCESS_BONUS = 0.0             # v8.5：50→0，"突破 peak_x" 在新层场景下是反向激励（鼓励右走回峰值），左探激励改由 PostLayerLeftBonusWrapper 独立覆盖
-BACKTRACK_TIMEOUT_STEPS = 120             # 后退超时步数（约4秒），超时无新发现则退出
-BACKTRACK_REVISIT_ZONE_PENALTY = 0.5      # 重复后退同一区间的衰减因子
-
-# ---- 新层短窗口左移奖励（v8.2：阶梯里程碑 + 左侧新层大奖 + 死亡折扣）----
-POST_LAYER_LEFT_BONUS_ENABLED = True
-POST_LAYER_LEFT_PER_PIXEL = 0.1           # 每像素新增左移的奖励
-POST_LAYER_LEFT_WINDOW = 60               # 窗口步数（≈2秒）；越过入口x或超时即关闭
-POST_LAYER_MILESTONES = ((15, 1.5), (30, 3.0), (60, 8.0))
-POST_LAYER_COMMIT_DEPTH = 0               # v8.4：1→0，落新层后只要还在 zone 内（未回右侧）就打折
-POST_LAYER_NEW_LAYER_LEFT_BONUS = 0.0     # v8.7：20→0，去掉链式跳层放大器，避免 drop-left-drop-die 的正反馈薅羊毛
-DEATH_PENALTY_POST_LAYER_FACTOR = 0.4     # v8.7：0.2→0.4，committed 死亡 -40，单层跳+左探+死变净负，但仍轻于全额防止风险厌恶
-
-# v8.8：前沿死亡折扣——让"右路前沿试探"死亡享受与左探同等折扣，消除方向不对称
-FRONTIER_DEATH_DISCOUNT_ENABLED = True
-FRONTIER_DEATH_TOLERANCE = 8              # 当前 x 与 max_x 差距 ≤ 该值视为"在前沿"
-FRONTIER_DEATH_WINDOW = 60                # 距上次 max_x 增长 ≤ 该步数视为"仍在推进"
-# 折扣乘子复用 DEATH_PENALTY_POST_LAYER_FACTOR
+SAVE_DIR = "./sb3_mario_logs"
+MODEL_SAVE_PATH = "./sb3_mario_model"
+EVAL_FREQ = 20_000
+CHECKPOINT_FREQ = 100_000
+RENDER_WHILE_TRAINING = False
+RENDER_DELAY_SEC = 0
 
 # ======================
-# 死循环检测：从包装链中取马里奥横向坐标
+# 工具函数与包装器（与 train_sb3.py 完全一致）
 # ======================
 def _get_mario_x_from_env(env):
-    """从任意一层包装中解包到底层 NES 环境，读取马里奥横向位置。"""
     e = env
     while e is not None:
         if hasattr(e, "_x_position"):
@@ -332,7 +207,7 @@ def _get_mario_x_from_env(env):
 
 
 def _get_mario_y_from_env(env):
-    """从包装链中读取马里奥纵向位置（NES RAM 0x03b8）。"""
+    """从任意一层包装中解包到底层 NES 环境，读取马里奥纵向位置。"""
     e = env
     while e is not None:
         if hasattr(e, "_y_position"):
@@ -348,59 +223,22 @@ def _get_mario_y_from_env(env):
 
 
 class DeadLoopDetector(Wrapper):
-    """
-    若连续 no_progress_max 步横向位移不足 min_dx 像素，则强制 truncated=True 结束本局；
-    可选 penalty：该步 reward 减去 penalty，让「关尾超时」比「真正过关」回报低。
-    无进展/慢速判定（供 ClipReward 扣分）：采用滑动窗口——最近 window 步内总位移若 < min_dx_in_window，
-    则设 info["no_progress"]，这样关尾小跳蹭步（每几步才动 8 像素）也会被罚，且各关卡通用。
-
-    坐标回绕时重置横向锚点与滑动窗口，避免误判循环超时。
-    """
-
-    def __init__(self, env, no_progress_max_steps, min_dx, penalty=0,
-                 no_progress_penalty_after=0, no_progress_min_dx_in_window=0,
-                 wrap_prev_x_min=900, wrap_curr_x_max=320, wrap_min_drop=100):
+    def __init__(self, env, no_progress_max_steps, min_dx):
         super().__init__(env)
         self._no_progress_max = no_progress_max_steps
         self._min_dx = min_dx
-        self._penalty = max(0, float(penalty))
-        self._window = max(0, int(no_progress_penalty_after))
-        self._min_dx_in_window = max(0, int(no_progress_min_dx_in_window))
-        self._wrap_prev_x_min = int(wrap_prev_x_min)
-        self._wrap_curr_x_max = int(wrap_curr_x_max)
-        self._wrap_min_drop = int(wrap_min_drop)
         self._x_anchor = 0
-        self._last_x = 0
         self._no_progress_steps = 0
-        self._x_history = deque(maxlen=self._window) if self._window > 0 else None
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._x_anchor = _get_mario_x_from_env(self.env)
-        self._last_x = self._x_anchor
         self._no_progress_steps = 0
-        if self._x_history is not None:
-            self._x_history.clear()
         return obs, info
-
-    def _is_coordinate_wrap_step(self, prev_x, current_x):
-        if prev_x < self._wrap_prev_x_min:
-            return False
-        if current_x > self._wrap_curr_x_max:
-            return False
-        if prev_x - current_x < self._wrap_min_drop:
-            return False
-        return True
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         current_x = _get_mario_x_from_env(self.env)
-        if self._is_coordinate_wrap_step(self._last_x, current_x):
-            self._x_anchor = current_x
-            self._no_progress_steps = 0
-            if self._x_history is not None:
-                self._x_history.clear()
-        # 死循环截断：仅当 no_progress_max > 0 时生效
         if self._no_progress_max > 0:
             if current_x - self._x_anchor >= self._min_dx:
                 self._x_anchor = current_x
@@ -410,929 +248,192 @@ class DeadLoopDetector(Wrapper):
             if self._no_progress_steps >= self._no_progress_max:
                 truncated = True
                 info["dead_loop"] = True
-                if self._penalty > 0:
-                    reward = reward - self._penalty
-        # 滑动窗口：最近 window 步内总位移不足则视为慢速/刷分（与是否启用死循环截断无关，各关卡通用）
-        if self._x_history is not None and self._min_dx_in_window > 0:
-            self._x_history.append(current_x)
-            if len(self._x_history) >= self._window:
-                dx_in_window = current_x - self._x_history[0]
-                if dx_in_window < self._min_dx_in_window:
-                    info["no_progress"] = True
-        self._last_x = current_x
         return obs, reward, terminated, truncated, info
 
 
-class CellExplorationWrapper(Wrapper):
-    """
-    二维格子探索奖励 + 死循环截断（迷宫模式核心）。
+class WarpBackDetector(Wrapper):
+    """7-4 走错分支时会被回传；检测 x 相对 max_x 的骤降并结束本局。
+    同时维护"分支里程碑"计数：max_x 跨过预设阈值的次数（PBRS 信号）。
     """
 
-    def __init__(self, env,
-                 cell_size=16,
-                 visit_bonus=1.0,
-                 revisit_reward=0.0,
-                 no_new_cell_steps=80,
-                 dead_loop_steps=150,
-                 frontier_bonus=0.0,
-                 y_layer_bonus=0.0,
-                 y_layer_size=32,
-                 y_layer_x_bucket=32,
-                 y_layer_confirm_dx=96,
-                 episode_cell_bonus_cap=30.0):
+    def __init__(self, env, min_drop, milestones=None, y_tolerance=32):
         super().__init__(env)
-        self._cell_size = int(cell_size)
-        self._visit_bonus = float(visit_bonus)
-        self._revisit_reward = float(revisit_reward)
-        self._no_new_cell_steps = int(no_new_cell_steps)
-        self._dead_loop_steps = int(dead_loop_steps)
-        self._frontier_bonus = float(frontier_bonus)
-        self._y_layer_bonus = float(y_layer_bonus)
-        self._y_layer_size = int(y_layer_size)
-        self._y_layer_x_bucket = int(y_layer_x_bucket)
-        self._y_layer_confirm_dx = int(y_layer_confirm_dx)
-        self._episode_cell_bonus_cap = float(episode_cell_bonus_cap)
-        self._episode_cell_bonus_total = 0.0
-        self._visited = set()
-        self._visited_y_layers = set()
-        self._pending_y_layers = []
-        self._frontier_used = set()
-        self._steps_without_new = 0
-        self._last_cell = None
-        self._same_cell_steps = 0
-        self._prev_y = 0
-        self._in_air = False
-        self._takeoff_y = 0
-        self._stable_streak = 0
-
-    def _cell(self, x, y):
-        return (int(x) // self._cell_size, int(y) // self._cell_size)
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self._visited.clear()
-        self._visited_y_layers.clear()
-        self._pending_y_layers = []
-        self._frontier_used.clear()
-        self._steps_without_new = 0
-        self._episode_cell_bonus_total = 0.0
-        x = _get_mario_x_from_env(self.env)
-        y = _get_mario_y_from_env(self.env)
-        start_cell = self._cell(x, y)
-        self._visited.add(start_cell)
-        self._visited_y_layers.add((x // self._y_layer_x_bucket, y // self._y_layer_size))
-        self._last_cell = start_cell
-        self._same_cell_steps = 0
-        self._prev_y = y
-        self._in_air = False
-        self._takeoff_y = y
-        self._stable_streak = 0
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        x = _get_mario_x_from_env(self.env)
-        y = _get_mario_y_from_env(self.env)
-        cell = self._cell(x, y)
-        prev_cell = self._last_cell
-        cell_changed = prev_cell is not None and cell != prev_cell
-        info["cell_changed"] = cell_changed
-
-        # 平台层探索奖励（延迟确认 + 级联兑现版）：落到新 y_layer 时"压栈"，
-        # 兑现规则（任一）：
-        #   (a) 最深 pending 的下层贴地横向覆盖 ≥ y_layer_confirm_dx → 级联兑现整栈；
-        #   (b) 不再"压栈即兑现"——必须由 (a) 触发后级联，避免"借更深一跳就把上一层免单确认"。
-        # 丢弃：落地后 y 回到某 pending 的起跳层附近（+半个 layer）→ 废弃该 pending
-        #       并把 bucket 移出 _visited_y_layers，下次真正探索可再拿。
-        # 同时通过 info 暴露 pending 状态，供 ClipReward 层做"缓存-退还"：
-        #   y_layer_pending_active        本步处理后栈是否非空
-        #   y_layer_pending_resolved_confirm  本步是否由确认导致栈被清空
-        #   y_layer_pending_resolved_discard  本步是否由废弃导致栈被清空
-        prev_pending_count = len(self._pending_y_layers)
-        dy = y - self._prev_y
-        platform_reward = 0.0
-        confirmed_this_step = False
-        landed = False
-        if dy != 0:
-            if not self._in_air:
-                self._in_air = True
-                self._takeoff_y = self._prev_y
-            self._stable_streak = 0
-        else:
-            self._stable_streak += 1
-            if self._in_air and self._stable_streak >= 2:
-                self._in_air = False
-                landed = True
-
-        if landed:
-            delta = y - self._takeoff_y  # 正值=往下跳
-            if delta >= self._y_layer_size:
-                bucket = (x // self._y_layer_x_bucket, y // self._y_layer_size)
-                if bucket not in self._visited_y_layers:
-                    self._visited_y_layers.add(bucket)
-                    mult = min(delta / self._y_layer_size, 4.0)
-                    self._pending_y_layers.append({
-                        "bucket": bucket,
-                        "reward": self._y_layer_bonus * mult,
-                        "takeoff_y": self._takeoff_y,
-                        "min_x": x,
-                        "max_x": x,
-                    })
-            # 丢弃检查：y 已回到某 pending 的起跳层附近 → 废弃
-            if self._pending_y_layers:
-                thr = self._y_layer_size // 2
-                kept = []
-                for p in self._pending_y_layers:
-                    if y <= p["takeoff_y"] + thr:
-                        self._visited_y_layers.discard(p["bucket"])
-                    else:
-                        kept.append(p)
-                self._pending_y_layers = kept
-
-        # 贴地帧：更新所有 pending 的横向覆盖；只用最深 pending 触发级联确认
-        if (not self._in_air) and self._pending_y_layers:
-            for p in self._pending_y_layers:
-                if y > p["takeoff_y"]:
-                    if x < p["min_x"]:
-                        p["min_x"] = x
-                    if x > p["max_x"]:
-                        p["max_x"] = x
-            deepest = self._pending_y_layers[-1]
-            if (deepest["max_x"] - deepest["min_x"]) >= self._y_layer_confirm_dx:
-                for p in self._pending_y_layers:
-                    platform_reward += p["reward"]
-                self._pending_y_layers = []
-                confirmed_this_step = True
-
-        new_pending_count = len(self._pending_y_layers)
-        info["y_layer_pending_active"] = (new_pending_count > 0)
-        # 只有"栈被清空"才算 resolved；中途丢弃/确认部分 pending 不算
-        if prev_pending_count > 0 and new_pending_count == 0:
-            info["y_layer_pending_resolved_confirm"] = bool(confirmed_this_step)
-            info["y_layer_pending_resolved_discard"] = not confirmed_this_step
-        else:
-            info["y_layer_pending_resolved_confirm"] = False
-            info["y_layer_pending_resolved_discard"] = False
-
-        if self._y_layer_bonus > 0 and platform_reward > 0:
-            reward += platform_reward
-            info["new_y_layer"] = True
-            info["y_layer_bonus_given"] = platform_reward  # 供 ClipReward 层读取，避免被覆盖
-        else:
-            info["new_y_layer"] = False
-            info["y_layer_bonus_given"] = 0.0
-        self._prev_y = y
-
-        # 仅在「贴地」帧更新格子探索：空中帧（_in_air=True）一律视为非新格
-        # 避免起跳弧线穿过相邻 y 格被算作探索；落地后第 2 帧 _in_air 才转 False，
-        # 1 帧延迟可接受（同 x 格通常在落地后立即被记入）。
-        if (not self._in_air) and cell not in self._visited:
-            self._visited.add(cell)
-            info["new_cell"] = True
-            info["cells_visited"] = len(self._visited)
-            self._steps_without_new = 0
-
-            # v4：sqrt 衰减 + 全局硬封顶，杜绝"错路 farm"
-            n = len(self._visited)
-            decayed = self._visit_bonus / (n ** 0.5)
-            if self._episode_cell_bonus_total < self._episode_cell_bonus_cap:
-                take = min(decayed,
-                           self._episode_cell_bonus_cap - self._episode_cell_bonus_total)
-                self._episode_cell_bonus_total += take
-                reward += take
-                info["cell_bonus_step"] = take
-            else:
-                info["cell_bonus_step"] = 0.0
-            info["episode_cell_bonus"] = self._episode_cell_bonus_total
-        else:
-            info["new_cell"] = False
-            info["cells_visited"] = len(self._visited)
-            info["maze_revisit_reward"] = self._revisit_reward
-            info["cell_bonus_step"] = 0.0
-            info["episode_cell_bonus"] = self._episode_cell_bonus_total
-            self._steps_without_new += 1
-            if self._revisit_reward != 0.0:
-                reward += self._revisit_reward
-
-        info["steps_without_new"] = int(self._steps_without_new)
-        info["no_new_cell_threshold"] = int(self._no_new_cell_steps)
-
-        if (self._no_new_cell_steps > 0
-                and self._steps_without_new >= self._no_new_cell_steps):
-            info["no_new_cell"] = True
-
-        if (self._dead_loop_steps > 0
-                and self._steps_without_new >= self._dead_loop_steps):
-            truncated = True
-            info["dead_loop"] = True
-            info["explore_timeout"] = True
-
-        if cell == prev_cell:
-            self._same_cell_steps += 1
-        else:
-            self._same_cell_steps = 0
-        info["same_cell_steps"] = self._same_cell_steps
-
-        cx, cy = cell
-        neighbors = [(cx + dx, cy + dy) for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))]
-        near_new = any(n not in self._visited for n in neighbors)
-        info["frontier_reward"] = 0.0
-        # frontier 一次性化：每个边界格至多发一次，杜绝在边界来回踱步的 per-step farm
-        if (self._frontier_bonus > 0
-                and near_new
-                and not info.get("new_cell", False)
-                and cell not in self._frontier_used):
-            self._frontier_used.add(cell)
-            reward += self._frontier_bonus
-            info["frontier_reward"] = float(self._frontier_bonus)
-
-        self._last_cell = cell
-        return obs, reward, terminated, truncated, info
-
-
-class StrategicBacktrackWrapper(Wrapper):
-    """
-    战略性后退激励器：识别并奖励"有目的的往回走"行为。
-
-    核心逻辑：
-    1. 持续跟踪本局最大 X 位置（_peak_x）
-    2. 当检测到从 _peak_x 开始的显著后退（dx <= -threshold）时，进入"后退模式"
-    3. 后退模式期间：
-       - 如果发现新格子（new_cell=True）→ 给予额外奖励（鼓励探索性后退）
-       - 记录后退距离和发现的新格子数
-    4. 当重新前进超过历史峰值时 → 给予"绕路成功"奖励（bonus）
-    5. 防滥用机制：
-       - 同一区间的重复后退会衰减奖励
-       - 后退超时无新发现 → 退出后退模式（避免死循环）
-
-    设计目标：
-    - 解决"智能体只往右走、不往回走探索"的问题
-    - 让 AI 学会：有时需要"先退后进"才能到达目标
-    - 特别适用于有坑/管道需要绕行的迷宫式关卡
-    """
-
-    def __init__(self, env,
-                 backtrack_threshold=80,
-                 backtrack_new_cell_bonus=2.0,
-                 backtrack_success_bonus=10.0,
-                 backtrack_timeout_steps=120,
-                 revisit_zone_penalty_factor=0.5):
-        super().__init__(env)
-        self._threshold = int(backtrack_threshold)
-        self._new_cell_bonus = float(backtrack_new_cell_bonus)
-        self._success_bonus = float(backtrack_success_bonus)
-        self._timeout = int(backtrack_timeout_steps)
-        self._revisit_factor = float(revisit_zone_penalty_factor)
-
-        self._peak_x = 0
-        self._prev_x = 0
-        self._in_backtrack = False
-        self._backtrack_start_x = 0
-        self._backtrack_steps = 0
-        self._backtrack_new_cells = 0
-        self._visited_backtrack_zones = set()
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        x = _get_mario_x_from_env(self.env)
-        self._peak_x = x
-        self._prev_x = x
-        self._in_backtrack = False
-        self._backtrack_start_x = x
-        self._backtrack_steps = 0
-        self._backtrack_new_cells = 0
-        self._visited_backtrack_zones.clear()
-        info["strategic_backtrack"] = False
-        info["backtrack_success"] = False
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        current_x = _get_mario_x_from_env(self.env)
-        dx = current_x - self._prev_x
-
-        info["strategic_backtrack"] = False
-        info["backtrack_success"] = False
-        info["backtrack_active"] = self._in_backtrack
-        # v8：bonus 通过 info 传递，由 ClipRewardExceptDeathWrapper 统一在最后无条件加上
-        # 直接 reward+= 会被 ClipReward 在 maze 正常步分支重写为 cell_bonus/frontier 等而丢失
-        info["backtrack_success_bonus"] = 0.0
-        info["backtrack_new_cell_bonus"] = 0.0
-
-        if current_x > self._peak_x:
-            old_peak = self._peak_x
-            self._peak_x = current_x
-
-            if self._in_backtrack:
-                self._in_backtrack = False
-                if self._backtrack_new_cells > 0:
-                    info["backtrack_success"] = True
-                    info["backtrack_success_bonus"] = self._success_bonus
-                    info["backtrack_new_cells_found"] = self._backtrack_new_cells
-                    info["backtrack_distance"] = old_peak - self._backtrack_start_x
-                self._backtrack_steps = 0
-                self._backtrack_new_cells = 0
-
-        elif (not self._in_backtrack
-              and current_x <= self._peak_x - self._threshold
-              and self._peak_x > 100):
-            zone_key = (self._peak_x // 100, current_x // 100)
-            if zone_key not in self._visited_backtrack_zones:
-                self._in_backtrack = True
-                self._backtrack_start_x = current_x
-                self._backtrack_steps = 0
-                self._backtrack_new_cells = 0
-                info["strategic_backtrack"] = True
-
-        if self._in_backtrack:
-            self._backtrack_steps += 1
-            if info.get("new_cell", False):
-                self._backtrack_new_cells += 1
-                info["backtrack_new_cell_bonus"] = self._new_cell_bonus
-
-            if self._backtrack_steps >= self._timeout:
-                zone_key = (self._peak_x // 100, self._backtrack_start_x // 100)
-                self._visited_backtrack_zones.add(zone_key)
-                self._in_backtrack = False
-                self._backtrack_steps = 0
-                self._backtrack_new_cells = 0
-
-        self._prev_x = current_x
-        return obs, reward, terminated, truncated, info
-
-
-class PostLayerLeftBonusWrapper(Wrapper):
-    """
-    新层短窗口左移奖励（v8.2）：阶梯里程碑 + 左侧新层大奖 + 死亡折扣信号。
-
-    设计目标：解决"Mario 怕跳坑死，宁可不左探"的死亡尾风险问题。
-      a) 阶梯发奖：尝试到 15/30/60px 各发一档，死在路上至少能吃到前几档；
-      b) 左侧新层大奖：活动窗口内若再触发 new_y_layer 且 x<entry_x → +bonus（真往左下找到下一层）；
-      c) committed 标记：累计左移 ≥ commit_depth 时置位，episode 内持久；
-         由 ClipReward 读取，作为"死亡惩罚减半"的依据。
-    """
-
-    def __init__(self, env,
-                 per_pixel=0.1,
-                 window_steps=60,
-                 milestones=((15, 1.5), (30, 3.0), (60, 8.0)),
-                 commit_depth=15,
-                 new_layer_left_bonus=20.0):
-        super().__init__(env)
-        self._per_pixel = float(per_pixel)
-        self._window = int(window_steps)
-        self._milestones = sorted([(int(d), float(b)) for d, b in milestones])
-        self._commit_depth = int(commit_depth)
-        self._new_layer_left_bonus = float(new_layer_left_bonus)
-        self._active = False
-        self._entry_x = 0
-        self._min_x = 0
-        self._steps_left = 0
-        self._milestones_paid = 0
-        # v8.3：committed 改为"几何 zone"语义——只要 _zone_active 且当前 x 距 zone_entry_x 的左移 >= commit_depth
-        # 不再用 episode 内持久标志（避免不相关死亡借光）
-        self._zone_entry_x = 0
-        self._zone_active = False
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self._active = False
-        self._entry_x = 0
-        self._min_x = 0
-        self._steps_left = 0
-        self._milestones_paid = 0
-        self._zone_entry_x = 0
-        self._zone_active = False
-        info["post_layer_left_bonus"] = 0.0
-        info["post_layer_committed"] = False
-        return obs, info
-
-    def _open_window(self, x):
-        self._active = True
-        self._entry_x = x
-        self._min_x = x
-        self._steps_left = self._window
-        self._milestones_paid = 0
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        current_x = _get_mario_x_from_env(self.env)
-        bonus = 0.0
-
-        new_y_layer = info.get("new_y_layer", False)
-
-        # ---- 几何 zone（独立于 bonus 窗口，无 60 步超时） ----
-        # 进入：每次 new_y_layer 都把 zone_entry_x 锚到当前 x（更深层会自动跟进）
-        # 离开：current_x > zone_entry_x（已重新越过起点右侧）
-        if new_y_layer:
-            self._zone_entry_x = current_x
-            self._zone_active = True
-        elif self._zone_active and current_x > self._zone_entry_x:
-            self._zone_active = False
-
-        # ---- bonus 窗口（仍受 60 步限制） ----
-        if new_y_layer:
-            if not self._active:
-                self._open_window(current_x)
-            elif current_x < self._entry_x:
-                bonus += self._new_layer_left_bonus
-                self._open_window(current_x)
-
-        if self._active:
-            if current_x > self._entry_x:
-                self._active = False
-                self._steps_left = 0
-            else:
-                self._steps_left -= 1
-                if current_x < self._min_x:
-                    delta_left = self._min_x - current_x
-                    bonus += self._per_pixel * delta_left
-                    self._min_x = current_x
-                    depth = self._entry_x - self._min_x
-                    while (self._milestones_paid < len(self._milestones)
-                            and depth >= self._milestones[self._milestones_paid][0]):
-                        bonus += self._milestones[self._milestones_paid][1]
-                        self._milestones_paid += 1
-                if self._steps_left <= 0:
-                    self._active = False
-
-        # committed = 当前在 zone 内 且 距 entry 的左移 >= commit_depth
-        # commit_depth=0 时：站在新层入口处也算 committed（即"刚跳到新层、未回右侧"全程打折）
-        post_committed = (self._zone_active
-                          and (self._zone_entry_x - current_x) >= self._commit_depth)
-
-        info["post_layer_left_bonus"] = bonus
-        info["post_layer_left_active"] = self._active
-        info["post_layer_left_depth"] = self._entry_x - self._min_x if self._active else 0
-        info["post_layer_committed"] = post_committed
-        info["post_layer_zone_active"] = self._zone_active
-        return obs, reward, terminated, truncated, info
-
-
-class FrontierProgressWrapper(Wrapper):
-    """v8.8：前沿推进追踪器——判断 Mario 是否正在'试探未知边界'。
-    用于让前沿死亡享受与左探相同的折扣，消除"右路死亡贵 / 左路死亡便宜"的不对称。
-
-    frontier_committed = True 仅当：
-      1) 当前 x 距本局 max_x ≤ tolerance（确实在最远处，没退）
-      2) 距 max_x 上次增长 ≤ window 步（最近还在推进，没在原地凑死）
-      3) max_x > 50（关卡起点附近不算）
-    """
-
-    def __init__(self, env, tolerance=8, window=60):
-        super().__init__(env)
-        self._tol = int(tolerance)
-        self._window = int(window)
-        self._max_x = 0
-        self._steps_since_grew = 0
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self._max_x = _get_mario_x_from_env(self.env)
-        self._steps_since_grew = 0
-        info["frontier_committed"] = False
-        info["frontier_max_x"] = int(self._max_x)
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        x = _get_mario_x_from_env(self.env)
-        if x > self._max_x:
-            self._max_x = x
-            self._steps_since_grew = 0
-        else:
-            self._steps_since_grew += 1
-        committed = (
-            (self._max_x - x) <= self._tol
-            and self._steps_since_grew <= self._window
-            and self._max_x > 50
+        self._min_drop = int(min_drop)
+        # 里程碑：(x, y) 元组，按 x 升序
+        self._milestones = sorted(
+            [(int(p[0]), int(p[1])) for p in (milestones or [])],
+            key=lambda p: p[0],
         )
-        info["frontier_committed"] = bool(committed)
-        info["frontier_max_x"] = int(self._max_x)
+        self._y_tol = int(y_tolerance)
+        self._max_x_seen = 0
+        self._next_idx = 0       # 下一条待判定的里程碑索引（永不回退）
+        self._awarded_count = 0  # 通过 y 判定、应计入奖励的里程碑数
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._max_x_seen = _get_mario_x_from_env(self.env)
+        self._next_idx = 0
+        self._awarded_count = 0
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        current_x = _get_mario_x_from_env(self.env)
+        current_y = _get_mario_y_from_env(self.env)
+
+        if current_x > self._max_x_seen:
+            self._max_x_seen = current_x
+
+        # 同步快照判定：x 首次越过 x_target 的那一帧立刻看 y。
+        # 通过 → 计入奖励；不通过 → 永久作废，绝不在后续位置补领（防止错分支后掉落到容差 y 也拿分）。
+        # 本 wrapper 位于 MaxAndSkipEnv 之前，逐帧调用，能看到精确跨越点。
+        while self._next_idx < len(self._milestones):
+            x_t, y_t = self._milestones[self._next_idx]
+            if self._max_x_seen < x_t:
+                break
+            self._next_idx += 1
+            if abs(current_y - y_t) <= self._y_tol:
+                self._awarded_count += 1
+
+        info["max_x"] = self._max_x_seen
+        info["mario_y"] = current_y
+        info["milestones_crossed"] = self._awarded_count
+
+        if self._min_drop > 0 and self._max_x_seen - current_x >= self._min_drop:
+            truncated = True
+            info["warp_back"] = True
+            info["warp_back_drop"] = self._max_x_seen - current_x
+
         return obs, reward, terminated, truncated, info
 
 
-class ClipRewardExceptDeathWrapper(Wrapper):
+class SimpleRewardWrapper(Wrapper):
     """
-    奖励裁剪与分级处理（支持直线/迷宫双模式）。
+    奖励 + 通关速度奖励：
+    - 正常步：clip(底层 Δx 奖励, -step_clip, +step_clip)。
+      累计总分 ≈ max_x - start_x，与步数无关，避免滞空刷分。
+    - 死亡步：-death_penalty
+    - 分支回传：-warp_back_penalty
+    - 死循环超时：-dead_loop_penalty
+    - 通关：flag_bonus + max(0, speed_base_steps - 已用步数) × speed_per_step
+      越快通关奖励越高，每多蹭一步就少拿 speed_per_step 分（>1.0 时蹭分严格亏损）
     """
 
-    def __init__(self, env,
-                 death_threshold=-15, death_penalty_seen=15,
-                 dead_loop_penalty_seen=10, no_progress_penalty_seen=0,
-                 step_penalty_seen=0,
-                 teleport_branch_base_penalty=8,
-                 wrong_branch_step_clawback=0.5,
-                 max_clawback=25.0,
-                 correct_wrap_bonus=5.0,
-                 maze_mode=False,
-                 maze_new_cell_reward=0.0,
-                 env_reward_scale=1.0,
-                 maze_no_progress_penalty=0.3,
-                 maze_no_progress_escalate_per_step=0.0,
-                 maze_no_progress_escalate_cap=0.0,
-                 maze_stall_penalty=0.0,
-                 maze_stall_escalate_per_step=0.0,
-                 maze_stall_escalate_cap=0.0,
-                 maze_step_penalty=0.0,
-                 death_penalty_post_layer_factor=1.0):
+    def __init__(self, env, death_threshold=-15, death_penalty=15,
+                 dead_loop_penalty=5, warp_back_penalty=80, flag_bonus=50,
+                 speed_base_steps=500, speed_per_step=1.5,
+                 step_clip=15.0, step_penalty=0.8, milestone_bonus=0.0):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
-        self._death_penalty = float(death_penalty_seen)
-        self._death_penalty_post_layer_factor = float(death_penalty_post_layer_factor)
-        self._dead_loop_penalty = float(dead_loop_penalty_seen)
-        self._no_progress_penalty = float(no_progress_penalty_seen)
-        self._step_penalty = float(step_penalty_seen)
-        self._teleport_branch_base = float(teleport_branch_base_penalty)
-        self._clawback_per_step = float(wrong_branch_step_clawback)
-        self._max_clawback = float(max_clawback)
-        self._correct_wrap_bonus = float(correct_wrap_bonus)
-        self._maze_mode = bool(maze_mode)
-        self._maze_new_cell_reward = float(maze_new_cell_reward)
-        self._env_reward_scale = float(env_reward_scale)
-        self._maze_no_progress_penalty = float(maze_no_progress_penalty)
-        self._maze_no_progress_escalate = float(maze_no_progress_escalate_per_step)
-        self._maze_no_progress_cap = float(maze_no_progress_escalate_cap)
-        self._maze_stall_penalty = float(maze_stall_penalty)
-        self._maze_stall_escalate_per_step = float(maze_stall_escalate_per_step)
-        self._maze_stall_escalate_cap = float(maze_stall_escalate_cap)
-        self._maze_step_penalty = float(maze_step_penalty)
-        # 不再 clawback：保留字段仅用于向 info 写入诊断（始终 = 0）
-        self._episode_positive_accum = 0.0
-        # v4：累积本局 stall 扣分（用于日志诊断）
-        self._episode_stall_penalty = 0.0
-        # y_layer pending 缓存-退还：在 pending 期间累加最终 reward，
-        # 由 CellExplorationWrapper 通过 info 的 resolve 标志决定提交/退还
-        self._y_pending_buffer = 0.0
-        self._y_pending_buffering = False
+        self._death_penalty = float(death_penalty)
+        self._dead_loop_penalty = float(dead_loop_penalty)
+        self._warp_back_penalty = float(warp_back_penalty)
+        self._flag_bonus = float(flag_bonus)
+        self._speed_base = int(speed_base_steps)
+        self._speed_per_step = float(speed_per_step)
+        self._step_clip = float(step_clip)
+        self._step_penalty = float(step_penalty)
+        self._milestone_bonus = float(milestone_bonus)
+        self._steps = 0
+        self._last_milestones = 0
 
     def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self._episode_positive_accum = 0.0
-        self._episode_stall_penalty = 0.0
-        self._y_pending_buffer = 0.0
-        self._y_pending_buffering = False
-        return obs, info
+        self._steps = 0
+        self._last_milestones = 0
+        return self.env.reset(**kwargs)
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self._steps += 1
 
-        is_correct_wrap = info.get("correct_wrap_new_area", False)
-        is_teleport = info.get("teleport_branch", False)
         is_dead_loop = info.get("dead_loop", False)
-        is_flag = bool(info.get("flag_get", False))
+        is_warp_back = info.get("warp_back", False)
+        is_flag = info.get("flag_get", False)
 
-        # 优先级 1：通关（直接放行——FlagGetBonusWrapper 会单独追加大额加权奖励）
+        is_death = (
+            not is_dead_loop
+            and not is_warp_back
+            and not is_flag
+            and (reward <= self._death_threshold or terminated)
+        )
+
         if is_flag:
-            pass
-
-        # 优先级 2：正确路回绕
-        elif is_correct_wrap:
-            reward = self._correct_wrap_bonus
-
-        # 优先级 3：管道回传（固定大额惩罚，不 clawback 已得探索分）
-        elif is_teleport:
-            reward = -self._teleport_branch_base
-            info["death_clawback"] = 0.0
-
-        # 优先级 4：探索超时 / 死循环截断
+            speed_bonus = max(0, self._speed_base - self._steps) * self._speed_per_step
+            reward = self._flag_bonus + speed_bonus
+        elif is_warp_back:
+            reward = -self._warp_back_penalty
         elif is_dead_loop:
             reward = -self._dead_loop_penalty
-            info["death_clawback"] = 0.0
-
-        # 优先级 5：死亡（固定惩罚，不 clawback —— 保证多探索 > 少探索）
-        # v8.2：本局曾 committed 到左探尝试 → 死亡惩罚按 factor 折扣，降低"怕跳坑"风险厌恶
-        # v8.8：折扣条件扩展为"任意一种探索推进"——左探 OR 右路前沿（消除方向不对称）
-        elif (reward <= self._death_threshold
-              or (terminated and not is_flag)):
-            penalty = self._death_penalty
-            if (info.get("post_layer_committed", False)
-                    or info.get("frontier_committed", False)):
-                penalty *= self._death_penalty_post_layer_factor
-            reward = -penalty
-            info["death_clawback"] = 0.0
-            info["death_penalty_applied"] = penalty
-
-        # 优先级 5：正常步
-        elif self._maze_mode:
-            frontier_add = float(info.get("frontier_reward", 0.0) or 0.0)
-            extra_bonus = float(info.get("y_layer_bonus_given", 0.0))
-            backtrack_active = info.get("backtrack_active", False)
-            # v8：bonus 统一通过 info 传入，下面三类在分支判定后无条件累加
-            backtrack_new_cell_bonus = float(info.get("backtrack_new_cell_bonus", 0.0) or 0.0)
-            backtrack_success_bonus = float(info.get("backtrack_success_bonus", 0.0) or 0.0)
-            post_layer_left_bonus = float(info.get("post_layer_left_bonus", 0.0) or 0.0)
-
-            if info.get("new_cell", False):
-                cell_bonus = float(info.get("cell_bonus_step", 0.0))
-                if reward >= 0:
-                    reward = reward * self._env_reward_scale + cell_bonus
-                else:
-                    reward = cell_bonus + (1.0 if backtrack_active else 0.0)
-            elif info.get("cell_changed", False):
-                base_revisit = float(info.get("maze_revisit_reward", 0.0))
-                if reward >= 0:
-                    reward = max(base_revisit, 0.0) + frontier_add
-                else:
-                    floor = 0.5 if backtrack_active else 0.0
-                    reward = max(base_revisit, floor) + frontier_add
-            else:
-                same_steps = int(info.get("same_cell_steps", 0))
-                escalated = min(
-                    self._maze_stall_penalty + same_steps * self._maze_stall_escalate_per_step,
-                    self._maze_stall_escalate_cap,
-                )
-                if self._maze_stall_penalty > 0:
-                    reward = -escalated + frontier_add
-                else:
-                    reward = frontier_add
-            # 三类 bonus 统一在最后加，避免被上面 reward= 重写时丢失
-            reward += extra_bonus + backtrack_new_cell_bonus + backtrack_success_bonus + post_layer_left_bonus
-            # 无新探索"持续扣分"——阶梯升级（v4：2 秒后开始，每多一步扣分递增）
-            if info.get("no_new_cell", False) and self._maze_no_progress_penalty > 0:
-                steps_over = max(
-                    0,
-                    int(info.get("steps_without_new", 0))
-                    - int(info.get("no_new_cell_threshold", 0)),
-                )
-                escalated = self._maze_no_progress_penalty + steps_over * self._maze_no_progress_escalate
-                if self._maze_no_progress_cap > 0:
-                    escalated = min(escalated, self._maze_no_progress_cap)
-                reward -= escalated
-                self._episode_stall_penalty += escalated
-            if self._maze_step_penalty > 0:
-                reward -= self._maze_step_penalty
-
+        elif is_death:
+            reward = -self._death_penalty
         else:
-            reward = float(np.sign(reward))
-            if info.get("no_progress", False) and self._no_progress_penalty > 0:
-                reward -= self._no_progress_penalty
-            if self._step_penalty > 0:
-                reward -= self._step_penalty
+            # 阈值 ≥ 平地最大 Δx/skip(~10-12)，保证快跑不被裁剪；
+            # ×0.1 把量级压回 ~±1。总分 ≈ Δx 总和，与 airtime 解耦。
+            # 再扣固定 step_penalty：每多走一步直接亏分，让 slow 路线总分严格低于 fast。
+            reward = float(np.clip(reward, -self._step_clip, self._step_clip)) * 0.1
+            reward -= self._step_penalty
 
-        # 已删除"死亡 clawback"逻辑：探索分一旦获得即归智能体所有
-        # 这是新方案的核心：保证"死亡(多探索) > 死亡(少探索)"层级
-
-        # v4 诊断：暴露本局累积 stall 扣分（每步都写，便于终局日志读取）
-        info["episode_stall_penalty"] = self._episode_stall_penalty
-
-        # ---- y_layer pending hold-then-release ----
-        # 在最终 reward 组合后、return 前处理：
-        #   - active：pending 期间，本步 reward > 0 时整段进 buffer 并把当前 step 的 reward 改为 0；
-        #             reward ≤ 0（penalty 主导步）正常通过——避免"跳坑没探索却每步发正分"。
-        #   - resolved_confirm：级联确认 → buffer 一次性补发，使之前 hold 住的探索分一次性入账。
-        #   - resolved_discard：栈被废弃 → 直接丢弃 buffer，不补发，净收益归零。
-        #   - terminated/truncated：清空 buffer，死在坑里的累计也丢。
-        info["y_layer_pending_buffered"] = self._y_pending_buffer
-        info["y_layer_pending_release"] = 0.0
-        info["y_layer_pending_held"] = 0.0
-        if info.get("y_layer_pending_resolved_confirm", False):
-            release = self._y_pending_buffer
-            reward += release
-            info["y_layer_pending_release"] = release
-            self._y_pending_buffer = 0.0
-            self._y_pending_buffering = False
-        elif info.get("y_layer_pending_resolved_discard", False):
-            self._y_pending_buffer = 0.0
-            self._y_pending_buffering = False
-        elif info.get("y_layer_pending_active", False):
-            if reward > 0:
-                self._y_pending_buffering = True
-                self._y_pending_buffer += reward
-                info["y_layer_pending_held"] = reward
-                reward = 0.0
-        if terminated or truncated:
-            self._y_pending_buffer = 0.0
-            self._y_pending_buffering = False
+        # PBRS 里程碑奖励：在 clip 之后叠加，避免 ±step_clip 把 +80 抹成 +1.5
+        # 终结步（flag/warp_back/death）也允许叠加：跨阈值在前、终结在后，应当承认这次跨越
+        if self._milestone_bonus > 0.0:
+            crossed = int(info.get("milestones_crossed", 0))
+            new_crossings = crossed - self._last_milestones
+            if new_crossings > 0 and not is_warp_back:
+                bonus = new_crossings * self._milestone_bonus
+                reward += bonus
+                info["milestone_bonus"] = bonus
+                self._last_milestones = crossed
+            elif new_crossings > 0:
+                # warp_back 时跨过阈值通常是因为 max_x 在前几步刚被推过去，回传不应给奖励
+                self._last_milestones = crossed
 
         return obs, reward, terminated, truncated, info
 
 
-class FlagGetBonusWrapper(Wrapper):
-    """
-    通关奖励 = 基础奖励 + 时间加权奖励
-        bonus = base_bonus + max(0, time_ref_steps - elapsed_steps) * time_per_step
-    与 train_sb3.py 中的实现保持一致。
-    """
-
-    def __init__(self, env, base_bonus=200.0,
-                 time_ref_steps=4500, time_per_step=0.05):
-        super().__init__(env)
-        self._base = float(base_bonus)
-        self._time_ref_steps = int(time_ref_steps)
-        self._time_per_step = float(time_per_step)
-        self._elapsed = 0
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self._elapsed = 0
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self._elapsed += 1
-        if info.get("flag_get"):
-            time_bonus = max(0, self._time_ref_steps - self._elapsed) * self._time_per_step
-            total = self._base + time_bonus
-            reward = reward + total
-            info["flag_base_bonus"] = self._base
-            info["flag_time_bonus"] = time_bonus
-            info["flag_total_bonus"] = total
-            info["flag_elapsed_steps"] = self._elapsed
-        return obs, reward, terminated, truncated, info
-
-
-class EpisodeMaxXWrapper(Wrapper):
-    """本局内跟踪世界坐标 x 的最大值，在 terminated/truncated 时写入 info['episode_max_x']（供训练日志打印）。"""
-    _MAX_VALID_X = 4000
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        x = _get_mario_x_from_env(self.env)
-        self._max_x = int(x) if 0 <= int(x) <= self._MAX_VALID_X else 0
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        x = _get_mario_x_from_env(self.env)
-        if 0 <= int(x) <= self._MAX_VALID_X and x > self._max_x:
-            self._max_x = x
-        if terminated or truncated:
-            info["episode_max_x"] = int(self._max_x)
-        return obs, reward, terminated, truncated, info
-
-
-# ======================
-# 构建环境（Gymnasium + 图像预处理，帧堆叠用 SB3 的 VecFrameStack）
-# ======================
 def make_env(env_id=None):
-    # 子进程内也屏蔽 np.bool8 等弃用警告（SubprocVecEnv 每个进程独立，需在此处再设一次）
     import warnings as _w
     _w.filterwarnings("ignore")
-    # 原始 gym 环境；env_id 为空则用训练配置 MARIO_ENV_ID（play 可传 v1 等看得更清楚）
     base = gym_super_mario_bros.make(env_id if env_id else MARIO_ENV_ID)
-    # 剥离 TimeLimit/OrderEnforcing，底层 NES 只返回 4 元组 (obs, reward, done, info)
     while hasattr(base, "env") and (
         "TimeLimit" in str(type(base)) or "OrderEnforcing" in str(type(base))
     ):
         base = base.env
     base = JoypadSpace(base, MOVEMENT_ACTIONS)
-    # 转为 Gymnasium 5 元组 API（直接用 shimmy 包装，无需 shimmy[gym-v21]）
     try:
         from shimmy.openai_gym_compatibility import GymV21CompatibilityV0
         env = GymV21CompatibilityV0(env=base)
     except ImportError:
         env = gym.make("GymV21Environment-v0", env=base)
 
-    if MAZE_MODE:
-        env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
-        env = WarpFrame(env, width=FRAME_SIZE, height=FRAME_SIZE)
-
-        env = CellExplorationWrapper(
+    if DEAD_LOOP_STEPS > 0:
+        env = DeadLoopDetector(env, no_progress_max_steps=DEAD_LOOP_STEPS, min_dx=DEAD_LOOP_MIN_DX)
+    if WARP_BACK_MIN_DROP > 0:
+        env = WarpBackDetector(
             env,
-            cell_size=CELL_SIZE,
-            visit_bonus=CELL_VISIT_BONUS,
-            revisit_reward=CELL_REVISIT_REWARD,
-            no_new_cell_steps=MAZE_NO_NEW_CELL_STEPS,
-            dead_loop_steps=MAZE_DEAD_LOOP_STEPS,
-            frontier_bonus=FRONTIER_BONUS,
-            y_layer_bonus=Y_LAYER_BONUS,
-            y_layer_size=Y_LAYER_SIZE,
-            y_layer_x_bucket=Y_LAYER_X_BUCKET,
-            y_layer_confirm_dx=Y_LAYER_CONFIRM_DX,
-            episode_cell_bonus_cap=CELL_BONUS_EPISODE_CAP,
+            min_drop=WARP_BACK_MIN_DROP,
+            milestones=MILESTONE_POINTS,
+            y_tolerance=MILESTONE_Y_TOLERANCE,
         )
 
-        if STRATEGIC_BACKTRACK_ENABLED:
-            env = StrategicBacktrackWrapper(
-                env,
-                backtrack_threshold=BACKTRACK_THRESHOLD,
-                backtrack_new_cell_bonus=BACKTRACK_NEW_CELL_BONUS,
-                backtrack_success_bonus=BACKTRACK_SUCCESS_BONUS,
-                backtrack_timeout_steps=BACKTRACK_TIMEOUT_STEPS,
-                revisit_zone_penalty_factor=BACKTRACK_REVISIT_ZONE_PENALTY,
-            )
-
-        if POST_LAYER_LEFT_BONUS_ENABLED:
-            env = PostLayerLeftBonusWrapper(
-                env,
-                per_pixel=POST_LAYER_LEFT_PER_PIXEL,
-                window_steps=POST_LAYER_LEFT_WINDOW,
-                milestones=POST_LAYER_MILESTONES,
-                commit_depth=POST_LAYER_COMMIT_DEPTH,
-                new_layer_left_bonus=POST_LAYER_NEW_LAYER_LEFT_BONUS,
-            )
-
-        if FRONTIER_DEATH_DISCOUNT_ENABLED:
-            env = FrontierProgressWrapper(
-                env,
-                tolerance=FRONTIER_DEATH_TOLERANCE,
-                window=FRONTIER_DEATH_WINDOW,
-            )
-
-        if ENABLE_TELEPORT_DETECTION:
-            env = TeleportBackDetector(
-                env,
-                max_x_history=TELEPORT_MAX_X_HISTORY,
-                branch_teleport_min_distance=TELEPORT_BRANCH_MIN_DISTANCE,
-                branch_teleport_tolerance=TELEPORT_BRANCH_TOLERANCE,
-                branch_relax_tolerance=TELEPORT_BRANCH_RELAX_TOLERANCE,
-                branch_large_jump_min_delta=TELEPORT_BRANCH_LARGE_JUMP_MIN_DELTA,
-                frame_mse_threshold=TELEPORT_FRAME_SIM_THRESHOLD,
-                wrap_prev_x_min=TELEPORT_WRAP_PREV_X_MIN,
-                wrap_curr_x_max=TELEPORT_WRAP_CURR_X_MAX,
-                backtrack_grace_steps=MAZE_BACKTRACK_GRACE_STEPS,
-                backtrack_single_step_max=MAZE_BACKTRACK_SINGLE_STEP_MAX,
-                save_replays=SAVE_TELEPORT_REPLAYS,
-                replay_dir=TELEPORT_REPLAY_DIR,
-                replay_max_count=TELEPORT_REPLAY_MAX_COUNT,
-            )
-
-        if CLIP_REWARD:
-            env = ClipRewardExceptDeathWrapper(
-                env,
-                death_threshold=DEATH_REWARD_THRESHOLD,
-                death_penalty_seen=DEATH_PENALTY_SEEN,
-                dead_loop_penalty_seen=DEAD_LOOP_PENALTY_SEEN,
-                teleport_branch_base_penalty=TELEPORT_BRANCH_BASE_PENALTY,
-                wrong_branch_step_clawback=WRONG_BRANCH_STEP_CLAWBACK,
-                max_clawback=MAX_CLAWBACK,
-                correct_wrap_bonus=CORRECT_WRAP_BONUS,
-                maze_mode=True,
-                maze_new_cell_reward=CELL_VISIT_BONUS,
-                env_reward_scale=ENV_REWARD_SCALE,
-                maze_no_progress_penalty=MAZE_NO_PROGRESS_PENALTY,
-                maze_no_progress_escalate_per_step=MAZE_NO_PROGRESS_ESCALATE,
-                maze_no_progress_escalate_cap=MAZE_NO_PROGRESS_ESCALATE_CAP,
-                maze_stall_penalty=MAZE_STALL_PENALTY,
-                maze_stall_escalate_per_step=MAZE_STALL_ESCALATE_PER_STEP,
-                maze_stall_escalate_cap=MAZE_STALL_ESCALATE_CAP,
-                maze_step_penalty=MAZE_STEP_PENALTY_SEEN,
-                death_penalty_post_layer_factor=DEATH_PENALTY_POST_LAYER_FACTOR,
-            )
-    else:
-        if DEAD_LOOP_STEPS > 0 or (NO_PROGRESS_PENALTY_AFTER > 0 and NO_PROGRESS_MIN_DX_IN_WINDOW > 0):
-            env = DeadLoopDetector(
-                env,
-                no_progress_max_steps=DEAD_LOOP_STEPS,
-                min_dx=DEAD_LOOP_MIN_DX,
-                penalty=DEAD_LOOP_PENALTY,
-                no_progress_penalty_after=NO_PROGRESS_PENALTY_AFTER,
-                no_progress_min_dx_in_window=NO_PROGRESS_MIN_DX_IN_WINDOW,
-                wrap_prev_x_min=TELEPORT_WRAP_PREV_X_MIN,
-                wrap_curr_x_max=TELEPORT_WRAP_CURR_X_MAX,
-                wrap_min_drop=TELEPORT_IMMEDIATE_DX,
-            )
-        env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
-        env = WarpFrame(env, width=FRAME_SIZE, height=FRAME_SIZE)
-        if ENABLE_TELEPORT_DETECTION:
-            env = TeleportBackDetector(
-                env,
-                max_x_history=TELEPORT_MAX_X_HISTORY,
-                branch_teleport_min_distance=TELEPORT_BRANCH_MIN_DISTANCE,
-                branch_teleport_tolerance=TELEPORT_BRANCH_TOLERANCE,
-                branch_relax_tolerance=TELEPORT_BRANCH_RELAX_TOLERANCE,
-                branch_large_jump_min_delta=TELEPORT_BRANCH_LARGE_JUMP_MIN_DELTA,
-                frame_mse_threshold=TELEPORT_FRAME_SIM_THRESHOLD,
-                wrap_prev_x_min=TELEPORT_WRAP_PREV_X_MIN,
-                wrap_curr_x_max=TELEPORT_WRAP_CURR_X_MAX,
-                backtrack_grace_steps=BACKTRACK_GRACE_STEPS,
-                backtrack_single_step_max=BACKTRACK_SINGLE_STEP_MAX,
-                save_replays=SAVE_TELEPORT_REPLAYS,
-                replay_dir=TELEPORT_REPLAY_DIR,
-                replay_max_count=TELEPORT_REPLAY_MAX_COUNT,
-            )
-        if CLIP_REWARD:
-            if CLIP_REWARD_EXCEPT_DEATH:
-                env = ClipRewardExceptDeathWrapper(
-                    env,
-                    death_threshold=DEATH_REWARD_THRESHOLD,
-                    death_penalty_seen=DEATH_PENALTY_SEEN,
-                    dead_loop_penalty_seen=DEAD_LOOP_PENALTY_SEEN,
-                    no_progress_penalty_seen=NO_PROGRESS_PENALTY_SEEN,
-                    step_penalty_seen=STEP_PENALTY_SEEN,
-                    teleport_branch_base_penalty=TELEPORT_BRANCH_BASE_PENALTY,
-                    wrong_branch_step_clawback=WRONG_BRANCH_STEP_CLAWBACK,
-                    max_clawback=MAX_CLAWBACK,
-                    correct_wrap_bonus=CORRECT_WRAP_BONUS,
-                    maze_mode=False,
-                )
-            else:
-                env = ClipRewardEnv(env)
-    if FLAG_BASE_BONUS > 0:
-        env = FlagGetBonusWrapper(
-            env,
-            base_bonus=FLAG_BASE_BONUS,
-            time_ref_steps=FLAG_TIME_REF_STEPS,
-            time_per_step=FLAG_TIME_PER_STEP,
-        )
-    env = EpisodeMaxXWrapper(env)
+    env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
+    env = WarpFrame(env, width=FRAME_SIZE, height=FRAME_SIZE)
+    env = SimpleRewardWrapper(
+        env,
+        death_threshold=-15,
+        death_penalty=DEATH_PENALTY_SEEN,
+        dead_loop_penalty=DEAD_LOOP_PENALTY_SEEN,
+        warp_back_penalty=WARP_BACK_PENALTY_SEEN,
+        flag_bonus=FLAG_GET_BONUS,
+        speed_base_steps=SPEED_BONUS_BASE_STEPS,
+        speed_per_step=SPEED_BONUS_PER_STEP,
+        step_penalty=STEP_PENALTY_SEEN,
+        milestone_bonus=MILESTONE_BONUS,
+    )
     env = Monitor(env)
     return env
 
 
 def _get_gym_env_for_render(vec_env):
-    """从 SB3 VecEnv 一路解包到可 render 的 gym 底层环境。"""
     venv = vec_env
     while hasattr(venv, "venv"):
         venv = venv.venv
@@ -1341,14 +442,12 @@ def _get_gym_env_for_render(vec_env):
     env = venv.envs[0]
     while env is not None:
         if hasattr(env, "gym_env"):
-            return env.gym_env  # shimmy 包装的 gym 环境
+            return env.gym_env
         env = getattr(env, "env", None)
     return None
 
 
 class RenderCallback(BaseCallback):
-    """训练时每隔若干步渲染一次游戏窗口，并可加延迟放慢动画。"""
-
     def __init__(self, render_every=1, render_delay_sec=0, verbose=0):
         super().__init__(verbose)
         self.render_every = max(1, int(render_every))
@@ -1360,7 +459,7 @@ class RenderCallback(BaseCallback):
             self._gym_env = _get_gym_env_for_render(self.training_env)
         if self._gym_env is not None and self.n_calls % self.render_every == 0:
             try:
-                self._gym_env.render(mode="human")  # 显示游戏窗口
+                self._gym_env.render(mode="human")
                 if self.render_delay_sec > 0:
                     time.sleep(self.render_delay_sec)
             except Exception:
@@ -1368,137 +467,153 @@ class RenderCallback(BaseCallback):
         return True
 
 
-class EarlyStoppingOnRewardDrop(BaseCallback):
-    """当 rollout 平均奖励相对历史最高持续偏低时提前停止训练（保留峰值附近策略）。"""
+class AdaptiveEntropyCallback(BaseCallback):
+    """
+    自适应熵系数：当 reward 长时间卡住（平台期）时自动提高 ent_coef 加大探索；
+    当 reward 开始回升（突破平台期）时自动降回来稳固策略。
 
-    def __init__(self, ratio=0.8, patience=5, check_freq=2500, verbose=0):
+    注意：必须用「环境总步数 num_timesteps」定检查间隔，不能用 callback 的 n_calls。
+    并行 NUM_ENVS 时，每步 n_calls 只 +1，但 num_timesteps 会 +NUM_ENVS；
+    若按 n_calls%5000 检查，要等约 5000*10*NUM_ENVS 环境步才会第一次抬熵，极易误以为“回调坏了”。
+    """
+
+    def __init__(self, base_ent_coef=0.01, max_ent_coef=0.05,
+                 check_interval_timesteps=20000, patience=12, boost_factor=1.2,
+                 decay_factor=0.85, min_improvement=10.0,
+                 flag_rate_window=100, flag_rate_threshold=0.3,
+                 collapse_ratio=0.7, collapse_min_peak=50.0,
+                 peak_forget_factor=0.999,
+                 verbose=1):
         super().__init__(verbose)
-        self.ratio = ratio
-        self.patience = patience
-        self.check_freq = check_freq
-        self.best_rew = -float("inf")
-        self.patience_count = 0
+        self._base = base_ent_coef
+        self._max = max_ent_coef
+        self._check_interval_timesteps = max(1000, int(check_interval_timesteps))
+        self._patience = patience
+        self._boost = boost_factor
+        self._decay = decay_factor
+        self._min_improvement = min_improvement
+        self._best_mean_rew = -float("inf")
+        self._stale_count = 0
+        self._last_check_ts = 0
+        self._flag_history = deque(maxlen=flag_rate_window)
+        self._flag_rate_threshold = flag_rate_threshold
+        self._collapse_ratio = collapse_ratio
+        self._collapse_min_peak = collapse_min_peak
+        self._peak_forget = peak_forget_factor
 
     def _current_mean_reward(self):
-        # 优先用 ep_info_buffer（近期完成的局），否则尝试 logger
         if getattr(self.model, "ep_info_buffer", None):
             buf = self.model.ep_info_buffer
             if buf:
-                rewards = [x.get("r", x.get("ep_rew", 0)) for x in buf if isinstance(x, dict)]
+                rewards = [x["r"] for x in buf if isinstance(x, dict) and "r" in x]
                 if rewards:
                     return sum(rewards) / len(rewards)
-        logger = getattr(self.model, "logger", None)
-        if logger and getattr(logger, "name_to_value", None):
-            v = logger.name_to_value.get("rollout/ep_rew_mean", None)
-            if v is not None:
-                return float(v)
         return None
 
+    def _current_flag_rate(self):
+        if len(self._flag_history) < 10:
+            return 0.0
+        return sum(self._flag_history) / len(self._flag_history)
+
     def _on_step(self):
-        if self.n_calls % self.check_freq != 0:
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if info.get("episode") is not None:
+                self._flag_history.append(1 if info.get("flag_get", False) else 0)
+
+        ts = getattr(self.model, "num_timesteps", 0)
+        if ts - self._last_check_ts < self._check_interval_timesteps:
             return True
+        self._last_check_ts = ts
+
         cur = self._current_mean_reward()
         if cur is None:
             return True
-        if cur > self.best_rew:
-            self.best_rew = cur
-            self.patience_count = 0
-        elif self.best_rew > 0 and cur < self.best_rew * self.ratio:
-            self.patience_count += 1
+
+        old_ent = float(self.model.ent_coef)
+        flag_rate = self._current_flag_rate()
+        already_winning = flag_rate >= self._flag_rate_threshold
+        peak = self._best_mean_rew
+
+        # 崩盘检测：reward 已远低于峰值 → 熵太高洗策略了，强制归位
+        # 同时把峰值也拉低，避免"永久门槛"挡住后续的突破分支
+        if peak > self._collapse_min_peak and cur < peak * self._collapse_ratio:
+            new_ent = self._base
+            self.model.ent_coef = new_ent
+            self._stale_count = 0
+            self._best_mean_rew = peak * self._collapse_ratio
             if self.verbose:
-                print("  [早停] 当前 rollout 均分 {:.1f} < 历史最高 {:.1f} 的 {:.0%}，计数 {}/{}".format(
-                    cur, self.best_rew, self.ratio, self.patience_count, self.patience))
-            if self.patience_count >= self.patience:
-                if self.verbose:
-                    print("  [早停] 达到耐心上限，提前结束训练（步数 {}）".format(self.n_calls))
-                return False  # 停止训练
+                print("  [自适应熵] 崩盘! reward={:.1f} < 峰值{:.1f}×{:.1f}, 重置 ent_coef: {:.4f} → {:.4f}".format(
+                    cur, peak, self._collapse_ratio, old_ent, new_ent))
+        elif already_winning:
+            new_ent = max(self._base, old_ent * self._decay)
+            self.model.ent_coef = new_ent
+            self._stale_count = 0
+            if cur > self._best_mean_rew:
+                self._best_mean_rew = cur
+            if self.verbose and abs(new_ent - old_ent) > 1e-6:
+                print("  [自适应熵] 通关率{:.0%}≥{:.0%}, 收敛策略, ent_coef: {:.4f} → {:.4f}".format(
+                    flag_rate, self._flag_rate_threshold, old_ent, new_ent))
+        elif cur > self._best_mean_rew + self._min_improvement:
+            self._best_mean_rew = cur
+            self._stale_count = 0
+            new_ent = max(self._base, old_ent * self._decay)
+            self.model.ent_coef = new_ent
+            if self.verbose and abs(new_ent - old_ent) > 1e-6:
+                print("  [自适应熵] 突破! reward={:.1f}, 通关率={:.0%}, ent_coef: {:.4f} → {:.4f}".format(
+                    cur, flag_rate, old_ent, new_ent))
         else:
-            self.patience_count = 0
+            # 慢遗忘峰值：防止历史高分永久锁死"突破"分支
+            if self._best_mean_rew > 0:
+                self._best_mean_rew *= self._peak_forget
+            self._stale_count += 1
+            if self._stale_count >= self._patience:
+                new_ent = min(self._max, old_ent * self._boost)
+                self.model.ent_coef = new_ent
+                self._stale_count = 0
+                if self.verbose:
+                    print("  [自适应熵] 平台期! 通关率={:.0%}, reward={:.1f}, ent_coef: {:.4f} → {:.4f}".format(
+                        flag_rate, cur, old_ent, new_ent))
+
+        if getattr(self.model, "logger", None) is not None:
+            self.model.logger.record("train/ent_coef", float(self.model.ent_coef))
+            self.model.logger.record("train/flag_rate", flag_rate)
+
         return True
 
 
-class DynamicEntCoefCallback(BaseCallback):
-    """
-    动态熵系数 v6：基于改进速率的连续调节。
-
-    核心思路：不再用"是否创新高"的二元判断，而是每隔 eval_interval 步计算
-    reward 的改进速率（rate = delta_reward / eval_interval），然后根据速率
-    连续地调节熵系数：
-      - 改进快（rate > fast_threshold）→ 熵向 min 方向移动（策略在进步，少探索）
-      - 改进慢或停滞（rate < slow_threshold）→ 熵向 max 方向移动（需要更多探索）
-      - 介于两者之间 → 熵向 base 方向回归
-
-    使用指数移动平均（EMA）平滑熵变化，避免突变。
-    """
-
-    def __init__(self, base_ent_coef=0.05, max_ent_coef=0.15,
-                 min_ent_coef=0.01,
-                 eval_interval=100_000,
-                 fast_threshold=30.0, slow_threshold=5.0,
-                 adjust_speed=0.1, reward_window=100,
-                 verbose=1):
+class EpisodeLogCallback(BaseCallback):
+    def __init__(self, verbose=0):
         super().__init__(verbose)
-        self._base = float(base_ent_coef)
-        self._min = float(min_ent_coef)
-        self._max = float(max_ent_coef)
-        self._eval_interval = int(eval_interval)
-        self._fast_threshold = float(fast_threshold)
-        self._slow_threshold = float(slow_threshold)
-        self._adjust_speed = float(adjust_speed)
-        self._reward_window = int(reward_window)
-        self._recent_rewards = []
-        self._current_ent = float(base_ent_coef)
-        self._prev_avg_reward = None
-        self._last_eval_step = 0
-        self._best_avg_reward = -float("inf")
+        self.episode_count = 0
 
-    def _on_step(self) -> bool:
-        for info in self.locals.get("infos", []):
-            ep_info = info.get("episode")
-            if ep_info is not None:
-                self._recent_rewards.append(ep_info["r"])
-                if len(self._recent_rewards) > self._reward_window:
-                    self._recent_rewards.pop(0)
-
-        if len(self._recent_rewards) < self._reward_window // 2:
-            return True
-
-        avg_reward = sum(self._recent_rewards) / len(self._recent_rewards)
-        self._best_avg_reward = max(self._best_avg_reward, avg_reward)
-
-        if (self.num_timesteps - self._last_eval_step) >= self._eval_interval:
-            self._last_eval_step = self.num_timesteps
-
-            if self._prev_avg_reward is not None:
-                rate = avg_reward - self._prev_avg_reward
-
-                if rate >= self._fast_threshold:
-                    target_ent = self._min
-                    label = "快速进步"
-                elif rate <= self._slow_threshold:
-                    target_ent = self._max
-                    label = "停滞/倒退"
+    def _on_step(self):
+        infos = self.locals.get("infos", [])
+        total_env_steps = getattr(self.model, "num_timesteps", self.n_calls)
+        for info in infos:
+            if info.get("episode") is not None:
+                self.episode_count += 1
+                r = info["episode"]["r"]
+                l = info["episode"]["l"]
+                max_x = int(info.get("max_x", 0))
+                ms = int(info.get("milestones_crossed", 0))
+                if info.get("warp_back"):
+                    suffix = "  [分支回传 drop={}]".format(int(info.get("warp_back_drop", 0)))
+                elif info.get("dead_loop"):
+                    suffix = "  [循环超时]"
+                elif info.get("flag_get"):
+                    speed_b = max(0, SPEED_BONUS_BASE_STEPS - int(l)) * SPEED_BONUS_PER_STEP
+                    suffix = "  [到达终点 速度奖励+{:.0f}]".format(speed_b)
                 else:
-                    t = (rate - self._slow_threshold) / (self._fast_threshold - self._slow_threshold)
-                    target_ent = self._max + t * (self._min - self._max)
-                    label = "中等进步"
-
-                old_ent = self._current_ent
-                self._current_ent = old_ent + self._adjust_speed * (target_ent - old_ent)
-                self._current_ent = max(self._min, min(self._max, self._current_ent))
-                self.model.ent_coef = self._current_ent
-
-                if self.verbose and abs(self._current_ent - old_ent) > 1e-6:
-                    direction = "↑" if self._current_ent > old_ent else "↓"
-                    print(f"  [DynEnt] {label}(rate={rate:.1f})，"
-                          f"ent_coef {direction} {self._current_ent:.4f} (target={target_ent:.4f})")
-
-            self._prev_avg_reward = avg_reward
-
-        if self.logger:
-            self.logger.record("train/entropy_coef", self._current_ent)
-            self.logger.record("train/dyn_ent_avg_reward", avg_reward)
-            self.logger.record("train/dyn_ent_best_avg", self._best_avg_reward)
+                    suffix = "  [死亡/其他]"
+                ec = getattr(self.model, "ent_coef", None)
+                ent_s = "ent={:.4f}".format(float(ec)) if ec is not None else "ent=N/A"
+                ms_tail = "  MS={}/{}".format(ms, len(MILESTONE_POINTS)) if ms > 0 else ""
+                print(
+                    "Episode {:4d} | Reward: {:6.1f} | Steps: {} | MaxX: {} | Total Steps: {} | {} |{}{}".format(
+                        self.episode_count, r, int(l), max_x, total_env_steps, ent_s, suffix, ms_tail
+                    )
+                )
         return True
 
 
@@ -1509,18 +624,16 @@ def main():
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.makedirs(os.path.join(SAVE_DIR, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(SAVE_DIR, "best"), exist_ok=True)
-    # 多环境：DummyVecEnv=同进程顺序执行，NUM_ENVS 越大每步要跑的 env 越多，墙钟时间越慢；SubprocVecEnv=多进程真并行
+
     VecEnvClass = SubprocVecEnv if USE_SUBPROC_VEC_ENV else DummyVecEnv
     env = VecEnvClass([make_env for _ in range(NUM_ENVS)])
     env = VecFrameStack(env, n_stack=FRAME_STACK)
 
     if not LOAD_CHECKPOINT or not os.path.isfile(LOAD_CHECKPOINT):
-        print("错误：未找到 checkpoint 文件，无法接着训练。")
-        print("请先运行 train_sb3.py 训练出模型，或修改 LOAD_CHECKPOINT 为已有 .zip 路径。")
-        print("当前路径: {}".format(LOAD_CHECKPOINT or "(空)"))
+        print("错误：未找到 checkpoint 文件: {}".format(LOAD_CHECKPOINT or "(空)"))
+        print("请先运行 train_sb3.py 训练出模型。")
         sys.exit(1)
 
-    # 若本次是从 best_model 接着训，先把当前 best 备份到 best_backups（带时间戳）
     best_dir = os.path.join(SAVE_DIR, "best")
     best_zip = os.path.join(best_dir, "best_model.zip")
     if os.path.normpath(LOAD_CHECKPOINT) == os.path.normpath(best_zip):
@@ -1532,105 +645,65 @@ def main():
         print("已备份当前 best_model → {}".format(backup_path))
 
     print("从 checkpoint 继续训练: {}".format(LOAD_CHECKPOINT))
-    if ALGORITHM.upper() == "DQN":
-        model = DQN.load(LOAD_CHECKPOINT, env=env, device=SB3_DEVICE)
-    else:
-        model = PPO.load(LOAD_CHECKPOINT, env=env, device=SB3_DEVICE)
-        if getattr(model, "ent_coef", None) is not None:
-            model.ent_coef = ENT_COEF_CONTINUE
-        if getattr(model, "learning_rate", None) is not None:
-            lr_decay_fraction = max(float(LR_CONTINUE_DECAY_END_FRACTION), 1e-8)
-            new_lr = (
-                get_linear_fn(LR_CONTINUE, LR_CONTINUE_END, end_fraction=lr_decay_fraction)
-                if USE_LR_DECAY_CONTINUE else LR_CONTINUE
-            )
-            # PPO.load() 会同时恢复 learning_rate 和 lr_schedule。
-            # SB3 _update_learning_rate() 用的是 lr_schedule，不是 learning_rate。
-            # 所以必须 _setup_lr_schedule() 重建 schedule，否则覆盖无效，仍走旧 LR。
-            model.learning_rate = new_lr
-            model._setup_lr_schedule()
-            # optimizer 的 param_groups[0]["lr"] 是从 checkpoint 恢复的旧值，
-            # 直到第一次 train() 才被 _update_learning_rate 覆盖；
-            # 这里立即同步，避免日志/TensorBoard 在头几步仍显示旧 LR。
-            initial_lr = float(model.lr_schedule(1.0))
-            for pg in model.policy.optimizer.param_groups:
-                pg["lr"] = initial_lr
-            print("✓ 学习率已重置: {:.2e} → {:.2e}（衰减末值 {:.2e}）".format(
-                initial_lr, LR_CONTINUE_END if USE_LR_DECAY_CONTINUE else initial_lr,
-                LR_CONTINUE_END))
-        # 与从头训一致的 PPO 超参，继续训时也改用稳收敛配置
-        model.n_steps = PPO_N_STEPS
-        model.batch_size = PPO_BATCH_SIZE
-        model.n_epochs = PPO_N_EPOCHS
-        # SB3 内部会调用 clip_range(progress_remaining)，必须为 callable，不能直接赋 float
-        model.clip_range = lambda _: PPO_CLIP_RANGE
-        # n_steps 改变后必须重建 rollout_buffer，否则 buffer 大小与 n_steps 不匹配会 IndexError
-        from stable_baselines3.common.buffers import RolloutBuffer
-        model.rollout_buffer = RolloutBuffer(
-            PPO_N_STEPS,
-            model.observation_space,
-            model.action_space,
-            device=model.device,
-            gamma=model.gamma,
-            gae_lambda=model.gae_lambda,
-            n_envs=model.n_envs,
-        )
+
+    _lr_schedule = (
+        get_linear_fn(LR_CONTINUE, LR_CONTINUE_END, end_fraction=1.0)
+        if USE_LR_DECAY_CONTINUE else (lambda _: LR_CONTINUE)
+    )
+
+    model = PPO.load(LOAD_CHECKPOINT, env=env, custom_objects={"learning_rate": _lr_schedule})
+    model.ent_coef = ENT_COEF_CONTINUE
+    model.learning_rate = _lr_schedule
+    model.n_steps = PPO_N_STEPS
+    model.batch_size = PPO_BATCH_SIZE
+    model.n_epochs = PPO_N_EPOCHS
+    model.clip_range = lambda _: PPO_CLIP_RANGE
+    model.gamma = GAMMA
 
     eval_env = DummyVecEnv([make_env])
     eval_env = VecFrameStack(eval_env, n_stack=FRAME_STACK)
-    # best_model 按「eval 平均奖励」最高的一次保存，不是 rollout
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=os.path.join(SAVE_DIR, "best"),
         log_path=SAVE_DIR,
         eval_freq=max(EVAL_FREQ // NUM_ENVS, 1),
-        n_eval_episodes=20,
+        n_eval_episodes=3,
         deterministic=True,
         verbose=0,
     )
-    # 多环境时：每次 callback 调用 = n_envs 步，需除以 NUM_ENVS 才能按「步数」保存
     checkpoint_callback = CheckpointCallback(
         save_freq=max(CHECKPOINT_FREQ // NUM_ENVS, 1),
         save_path=os.path.join(SAVE_DIR, "checkpoints"),
         name_prefix="mario",
     )
 
-    callbacks = [EpisodeLogCallback(), eval_callback, checkpoint_callback]
-    if DYN_ENT_ENABLED and ALGORITHM.upper() == "PPO":
-        callbacks.append(DynamicEntCoefCallback(
-            base_ent_coef=ENT_COEF_CONTINUE,
-            max_ent_coef=DYN_ENT_MAX,
-            min_ent_coef=DYN_ENT_MIN,
-            eval_interval=DYN_ENT_EVAL_INTERVAL,
-            fast_threshold=DYN_ENT_FAST_THRESHOLD,
-            slow_threshold=DYN_ENT_SLOW_THRESHOLD,
-            adjust_speed=DYN_ENT_ADJUST_SPEED,
-            verbose=1,
-        ))
-        print("动态熵系数 v6 已启用：base={} min={} max={} 每{}步评估速率".format(
-            ENT_COEF_CONTINUE, DYN_ENT_MIN, DYN_ENT_MAX, DYN_ENT_EVAL_INTERVAL))
-    if EARLY_STOP_ENABLED:
-        callbacks.append(EarlyStoppingOnRewardDrop(
-            ratio=EARLY_STOP_RATIO,
-            patience=EARLY_STOP_PATIENCE,
-            check_freq=max(EVAL_FREQ // NUM_ENVS, 1),
-            verbose=1,
-        ))
-        print("🛑 已启用早停：当 rollout 均分持续低于历史最高的 {:.0%} 且连续 {} 次检查则停止".format(
-            EARLY_STOP_RATIO, EARLY_STOP_PATIENCE))
+    callbacks = [EpisodeLogCallback(), eval_callback, checkpoint_callback,
+                 AdaptiveEntropyCallback(
+                     base_ent_coef=ENT_COEF_CONTINUE,
+                     max_ent_coef=ENT_COEF_MAX,
+                     check_interval_timesteps=20000,
+                     patience=12,
+                     boost_factor=1.2,
+                     decay_factor=0.85,
+                     min_improvement=10.0,
+                     verbose=1,
+                 )]
     if RENDER_WHILE_TRAINING:
         callbacks.append(RenderCallback(
             render_every=RENDER_WHILE_TRAINING,
             render_delay_sec=RENDER_DELAY_SEC,
         ))
-        print("🖥️ 已开启训练时游戏画面显示（每 {} 步刷新，延迟 {:.2f}s 放慢动画）".format(
-            RENDER_WHILE_TRAINING, RENDER_DELAY_SEC
-        ))
 
-    print("🚀 开始训练（SB3 + Gymnasium + 马里奥，接着训）...")
-    print("SB3 计算设备: {}（配置 SB3_DEVICE={}）".format(model.device, SB3_DEVICE))
-    print("本轮将再训练 {} 步（在 checkpoint 基础上）".format(ADDITIONAL_TIMESTEPS))
-    print_episode_log_banner()
+    print("🚀 开始训练（SB3 + PPO + 马里奥，接着训）...")
+    print("关卡: {} | 动作集: {} 个 | 帧跳过: {} | 并行环境: {}".format(
+        MARIO_ENV_ID, len(MOVEMENT_ACTIONS), FRAME_SKIP, NUM_ENVS))
+    print("奖励: 正常步 clip(Δx,-3,+3) | 死亡-{} | 通关+{}+速度奖励(基准{}步,每省1步+{})".format(
+        DEATH_PENALTY_SEEN, FLAG_GET_BONUS, SPEED_BONUS_BASE_STEPS, SPEED_BONUS_PER_STEP))
+    print("分支里程碑(PBRS): 点(x,y)={} y容差={} | 每到一个 +{:.0f}".format(
+        MILESTONE_POINTS, MILESTONE_Y_TOLERANCE, MILESTONE_BONUS))
+    print("本轮将再训练 {} 步".format(ADDITIONAL_TIMESTEPS))
+    print("Episode 列 | ent=当前 PPO 熵系数（自适应回调会动态修改）")
+    print("-" * 88)
     model.learn(
         total_timesteps=ADDITIONAL_TIMESTEPS,
         callback=callbacks,
