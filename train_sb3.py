@@ -138,7 +138,7 @@ TOTAL_TIMESTEPS = 20_000_000
 # 不能用 np.sign：会把"覆盖距离"扭成"出现正 Δx 的步数"，慢速高跳每个滞空帧都拿满 +1 → 刷分
 DEATH_PENALTY_SEEN = 50      # 死亡惩罚。15 = 只需前进 15 步就能回本，冒险跨坑是划算的
 FLAG_GET_BONUS = 50           # 通关额外奖励，远大于死亡惩罚，鼓励冲终点
-STEP_PENALTY_SEEN = 0.1       # 普通步小惩罚；向右正常推进应为正分，停顿/慢蹭仍亏分
+STEP_PENALTY_SEEN = 0.05       # 普通步小惩罚；向右正常推进应为正分，停顿/慢蹭仍亏分
 
 # 死循环检测
 DEAD_LOOP_STEPS = 500        # 约 33 秒无进展才结束（为传送台/电梯留足时间）
@@ -149,14 +149,18 @@ DEAD_LOOP_PENALTY_SEEN = 80
 WARP_BACK_MIN_DROP = 96
 WARP_BACK_PENALTY_SEEN = 20
 
+# x 坐标合理上限：_x_position = ram[0x6d]*256 + ram[0x86]，关卡加载/传送过渡帧
+# 会读到垃圾页号（如 0xFF → x≈65534）。SMB 单关至多几千像素，超过此值视为脏数据丢弃。
+X_POS_SANITY_MAX = 8192
+
 # 7-4 分支里程碑（PBRS）：首次到达列表中的 (x, y) 点附近时发一次正奖励
 # 用途：通关只在最后给信号，分支判断收不到局部反馈；这里给"刚选对了第 k 个分支"提供即时信号
 # 调参：手动观察 7-4，把每个正确分支后的稳定 (x, y) 坐标列入此列表（按 x 递增顺序）
 #       y 是马里奥纵坐标（NES：值越小越靠上），MILESTONE_Y_TOLERANCE 控制纵向容差像素
 # 触发条件：max_x_seen >= x_target 且 |current_y - y_target| <= MILESTONE_Y_TOLERANCE
 # 实现：按顺序累计单调递增，到达同一里程碑不重复发；穿透 MaxAndSkipEnv 也能完整保留
-MILESTONE_POINTS = [(285, 64), (1230, 128), (1576, 128), (1518, 176), (1590, 64), (1910, 64), (2000, 128), (2120, 64), (2500, 128)]
-MILESTONE_Y_TOLERANCE = 8
+MILESTONE_POINTS = [(285, 64), (1230, 128), (1582, 110), (1550, 110), (1518, 176)]
+MILESTONE_Y_TOLERANCE = 32
 MILESTONE_BONUS = 80.0
 
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
@@ -166,7 +170,7 @@ SPEED_BONUS_BASE_STEPS = 600
 SPEED_BONUS_PER_STEP = 2
 
 # PPO 超参
-ENT_COEF = 0.02
+ENT_COEF = 0.03
 ENT_COEF_MAX = 0.12  # 自适应熵上限；7 动作空间 0.2 会把 logits 抹平导致策略崩塌
 LR = 2.5e-4
 LR_END = 1e-5
@@ -175,7 +179,7 @@ PPO_N_STEPS = 512
 PPO_BATCH_SIZE = 256
 PPO_N_EPOCHS = 4
 PPO_CLIP_RANGE = 0.2
-GAMMA = 0.995
+GAMMA = 0.99
 
 SAVE_DIR = "./sb3_mario_logs"
 MODEL_SAVE_PATH = "./sb3_mario_model"
@@ -231,14 +235,16 @@ class DeadLoopDetector(Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        self._x_anchor = _get_mario_x_from_env(self.env)
+        x0 = _get_mario_x_from_env(self.env)
+        self._x_anchor = x0 if 0 <= x0 <= X_POS_SANITY_MAX else 0
         self._no_progress_steps = 0
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         current_x = _get_mario_x_from_env(self.env)
-        if self._no_progress_max > 0:
+        # 脏数据帧（垃圾页号）跳过本帧无进展统计，避免误判
+        if self._no_progress_max > 0 and 0 <= current_x <= X_POS_SANITY_MAX:
             if current_x - self._x_anchor >= self._min_dx:
                 self._x_anchor = current_x
                 self._no_progress_steps = 0
@@ -270,7 +276,8 @@ class WarpBackDetector(Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        self._max_x_seen = _get_mario_x_from_env(self.env)
+        x0 = _get_mario_x_from_env(self.env)
+        self._max_x_seen = x0 if 0 <= x0 <= X_POS_SANITY_MAX else 0
         self._next_idx = 0
         self._awarded_count = 0
         return obs, info
@@ -280,25 +287,29 @@ class WarpBackDetector(Wrapper):
         current_x = _get_mario_x_from_env(self.env)
         current_y = _get_mario_y_from_env(self.env)
 
-        if current_x > self._max_x_seen:
-            self._max_x_seen = current_x
+        # 脏数据帧（关卡加载/传送过渡读到垃圾页号，x≈65534）：跳过本帧所有判定，
+        # 不污染 max_x，也不触发 warp_back / 里程碑。
+        x_valid = 0 <= current_x <= X_POS_SANITY_MAX
+        if x_valid:
+            if current_x > self._max_x_seen:
+                self._max_x_seen = current_x
 
-        # 同步快照判定：x 首次越过 x_target 的那一帧立刻看 y。
-        # 通过 → 计入奖励；不通过 → 永久作废，绝不在后续位置补领（防止错分支后掉落到容差 y 也拿分）。
-        # 本 wrapper 位于 MaxAndSkipEnv 之前，逐帧调用，能看到精确跨越点。
-        while self._next_idx < len(self._milestones):
-            x_t, y_t = self._milestones[self._next_idx]
-            if self._max_x_seen < x_t:
-                break
-            self._next_idx += 1
-            if abs(current_y - y_t) <= self._y_tol:
-                self._awarded_count += 1
+            # 同步快照判定：x 首次越过 x_target 的那一帧立刻看 y。
+            # 通过 → 计入奖励；不通过 → 永久作废，绝不在后续位置补领（防止错分支后掉落到容差 y 也拿分）。
+            # 本 wrapper 位于 MaxAndSkipEnv 之前，逐帧调用，能看到精确跨越点。
+            while self._next_idx < len(self._milestones):
+                x_t, y_t = self._milestones[self._next_idx]
+                if self._max_x_seen < x_t:
+                    break
+                self._next_idx += 1
+                if abs(current_y - y_t) <= self._y_tol:
+                    self._awarded_count += 1
 
         info["max_x"] = self._max_x_seen
         info["mario_y"] = current_y
         info["milestones_crossed"] = self._awarded_count
 
-        if self._min_drop > 0 and self._max_x_seen - current_x >= self._min_drop:
+        if x_valid and self._min_drop > 0 and self._max_x_seen - current_x >= self._min_drop:
             truncated = True
             info["warp_back"] = True
             info["warp_back_drop"] = self._max_x_seen - current_x
