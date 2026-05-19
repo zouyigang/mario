@@ -152,20 +152,33 @@ WARP_BACK_PENALTY_SEEN = 20
 # 会读到垃圾页号（如 0xFF → x≈65534）。SMB 单关至多几千像素，超过此值视为脏数据丢弃。
 X_POS_SANITY_MAX = 8192
 
-# 7-4 分支里程碑（PBRS）：首次到达列表中的 (x, y) 点附近时发一次正奖励
+# 分支里程碑（PBRS）：到达列表中的 (x, y) 点附近时发一次正奖励
 # 用途：通关只在最后给信号，分支判断收不到局部反馈；这里给"刚选对了第 k 个分支"提供即时信号
-# 调参：手动观察 7-4，把每个正确分支后的稳定 (x, y) 坐标列入此列表（按 x 递增顺序）
-#       y 是马里奥纵坐标（NES：值越小越靠上），MILESTONE_Y_TOLERANCE 控制纵向容差像素
-# 触发条件：max_x_seen >= x_target 且 |current_y - y_target| <= MILESTONE_Y_TOLERANCE
-# 实现：按顺序累计单调递增，到达同一里程碑不重复发；穿透 MaxAndSkipEnv 也能完整保留
+# 调参：手动观察关卡，把每个关键 (x, y) 坐标按【路径行进顺序】列入此列表（可含向左回退点）。
+#       y 是马里奥纵坐标（NES：值越小越靠上），X/Y_TOLERANCE 控制横纵向容差像素。
+# 触发条件：按列表顺序，马里奥坐标邻近当前待判定点时点亮：
+#           |current_x - x_target| <= X_TOL 且 |current_y - y_target| <= Y_TOL
+# 实现：_next_idx 单调递增，逐个领取、每点只领一次；不依赖单调 max_x，支持向左回退到达。
 MILESTONE_POINTS = [(285, 64), (1230, 128), (1582, 110), (1550, 110), (1518, 176)]
+MILESTONE_X_TOLERANCE = 2
 MILESTONE_Y_TOLERANCE = 32
 MILESTONE_BONUS = 80.0
+
+# 减分坐标点：与上面的里程碑机制完全相同，只是把"加分"换成"扣分"
+# 用途：手工标记不希望马里奥经过/停留的位置（错误分支、危险区域等），到达即给即时负反馈
+# 调参：手动维护下列 (x, y) 坐标（按【路径行进顺序】），X/Y_TOLERANCE 控制容差像素
+# 触发条件：按列表顺序坐标邻近当前待判定点时扣分：
+#           |current_x - x_target| <= X_TOL 且 |current_y - y_target| <= Y_TOL
+# 实现：_next_penalty_idx 单调递增，逐个判定、每点只扣一次；支持向左回退到达。
+PENALTY_POINTS = [(1620, 110)]
+PENALTY_X_TOLERANCE = 2
+PENALTY_Y_TOLERANCE = 32
+PENALTY_AMOUNT = 100.0
 
 # 通关速度奖励：flag_bonus + max(0, BASE_STEPS - 实际步数) × PER_STEP
 # 每多走一步就少拿 1.5 分（而前进只赚 1.0），在「快通与蹭分步数都 ≤ BASE」时净亏 0.5/步
 # BASE 要大于「该关正常快通步数 + 可能出现的蹭分步数」，否则快通已贴顶、蹭分只靠多走 +1 会反超
-SPEED_BONUS_BASE_STEPS = 600
+SPEED_BONUS_BASE_STEPS = 400
 SPEED_BONUS_PER_STEP = 2
 
 # 加载模型
@@ -173,9 +186,9 @@ LOAD_CHECKPOINT = os.path.join("sb3_mario_logs", "best", "best_model.zip")
 ADDITIONAL_TIMESTEPS = 10_000_000
 
 # 接着训的 PPO 超参（比从头训稍保守）
-ENT_COEF_CONTINUE = 0.02
+ENT_COEF_CONTINUE = 0.01
 # 自适应熵回调里 ent_coef 的上限；7 动作空间 0.2 会把 logits 抹平导致策略崩塌
-ENT_COEF_MAX = 0.12
+ENT_COEF_MAX = 0.08
 LR_CONTINUE = 1e-4
 LR_CONTINUE_END = 1e-5
 USE_LR_DECAY_CONTINUE = True
@@ -259,21 +272,27 @@ class DeadLoopDetector(Wrapper):
 
 class WarpBackDetector(Wrapper):
     """7-4 走错分支时会被回传；检测 x 相对 max_x 的骤降并结束本局。
-    同时维护"分支里程碑"计数：max_x 跨过预设阈值的次数（PBRS 信号）。
+    同时维护"分支里程碑"计数（加分）与"减分坐标点"计数：max_x 跨过预设阈值的次数（PBRS 信号）。
     """
 
-    def __init__(self, env, min_drop, milestones=None, y_tolerance=32):
+    def __init__(self, env, min_drop, milestones=None,
+                 x_tolerance=32, y_tolerance=32,
+                 penalties=None, penalty_x_tolerance=32, penalty_y_tolerance=32):
         super().__init__(env)
         self._min_drop = int(min_drop)
-        # 里程碑：(x, y) 元组，按 x 升序
-        self._milestones = sorted(
-            [(int(p[0]), int(p[1])) for p in (milestones or [])],
-            key=lambda p: p[0],
-        )
+        # 里程碑：(x, y) 元组，保留【路径行进顺序】（可含向左回退点，不按 x 排序）
+        self._milestones = [(int(p[0]), int(p[1])) for p in (milestones or [])]
+        self._x_tol = int(x_tolerance)
         self._y_tol = int(y_tolerance)
+        # 减分坐标点：(x, y) 元组，保留路径顺序（与里程碑机制相同，方向相反）
+        self._penalties = [(int(p[0]), int(p[1])) for p in (penalties or [])]
+        self._penalty_x_tol = int(penalty_x_tolerance)
+        self._penalty_y_tol = int(penalty_y_tolerance)
         self._max_x_seen = 0
         self._next_idx = 0       # 下一条待判定的里程碑索引（永不回退）
         self._awarded_count = 0  # 通过 y 判定、应计入奖励的里程碑数
+        self._next_penalty_idx = 0  # 下一条待判定的减分点索引（永不回退）
+        self._penalty_count = 0     # 通过 y 判定、应计入扣分的减分点数
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -281,6 +300,8 @@ class WarpBackDetector(Wrapper):
         self._max_x_seen = x0 if 0 <= x0 <= X_POS_SANITY_MAX else 0
         self._next_idx = 0
         self._awarded_count = 0
+        self._next_penalty_idx = 0
+        self._penalty_count = 0
         return obs, info
 
     def step(self, action):
@@ -295,20 +316,30 @@ class WarpBackDetector(Wrapper):
             if current_x > self._max_x_seen:
                 self._max_x_seen = current_x
 
-            # 同步快照判定：x 首次越过 x_target 的那一帧立刻看 y。
-            # 通过 → 计入奖励；不通过 → 永久作废，绝不在后续位置补领（防止错分支后掉落到容差 y 也拿分）。
-            # 本 wrapper 位于 MaxAndSkipEnv 之前，逐帧调用，能看到精确跨越点。
-            while self._next_idx < len(self._milestones):
+            # 坐标邻近判定：按路径顺序，只判定 _next_idx 指向的那一个里程碑点。
+            # 马里奥坐标进入该点容差框（x、y 同时满足）→ 点亮并前移索引。
+            # _next_idx 单调递增，保证按路径顺序逐个领取、每点只领一次；
+            # 因为不依赖单调递增的 max_x，向左回退到达目标点同样能触发。
+            # 本 wrapper 位于 MaxAndSkipEnv 之前，逐帧调用，能看到精确到达点。
+            if self._next_idx < len(self._milestones):
                 x_t, y_t = self._milestones[self._next_idx]
-                if self._max_x_seen < x_t:
-                    break
-                self._next_idx += 1
-                if abs(current_y - y_t) <= self._y_tol:
+                if abs(current_x - x_t) <= self._x_tol and abs(current_y - y_t) <= self._y_tol:
+                    self._next_idx += 1
                     self._awarded_count += 1
+
+            # 减分坐标点：与里程碑判定逻辑完全一致，只是单独累计计数
+            if self._next_penalty_idx < len(self._penalties):
+                x_t, y_t = self._penalties[self._next_penalty_idx]
+                if (abs(current_x - x_t) <= self._penalty_x_tol
+                        and abs(current_y - y_t) <= self._penalty_y_tol):
+                    self._next_penalty_idx += 1
+                    self._penalty_count += 1
 
         info["max_x"] = self._max_x_seen
         info["mario_y"] = current_y
         info["milestones_crossed"] = self._awarded_count
+        info["milestones_total"] = len(self._milestones)
+        info["penalties_crossed"] = self._penalty_count
 
         if x_valid and self._min_drop > 0 and self._max_x_seen - current_x >= self._min_drop:
             truncated = True
@@ -333,7 +364,8 @@ class SimpleRewardWrapper(Wrapper):
     def __init__(self, env, death_threshold=-15, death_penalty=15,
                  dead_loop_penalty=5, warp_back_penalty=80, flag_bonus=50,
                  speed_base_steps=500, speed_per_step=1.5,
-                 step_clip=15.0, step_penalty=0.8, milestone_bonus=0.0):
+                 step_clip=15.0, step_penalty=0.8, milestone_bonus=0.0,
+                 coord_penalty=0.0):
         super().__init__(env)
         self._death_threshold = float(death_threshold)
         self._death_penalty = float(death_penalty)
@@ -345,12 +377,15 @@ class SimpleRewardWrapper(Wrapper):
         self._step_clip = float(step_clip)
         self._step_penalty = float(step_penalty)
         self._milestone_bonus = float(milestone_bonus)
+        self._coord_penalty = float(coord_penalty)
         self._steps = 0
         self._last_milestones = 0
+        self._last_penalties = 0
 
     def reset(self, **kwargs):
         self._steps = 0
         self._last_milestones = 0
+        self._last_penalties = 0
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -398,6 +433,19 @@ class SimpleRewardWrapper(Wrapper):
                 # warp_back 时跨过阈值通常是因为 max_x 在前几步刚被推过去，回传不应给奖励
                 self._last_milestones = crossed
 
+        # 减分坐标点：与里程碑奖励对称，只是把分数变为负
+        if self._coord_penalty > 0.0:
+            p_crossed = int(info.get("penalties_crossed", 0))
+            new_p = p_crossed - self._last_penalties
+            if new_p > 0 and not is_warp_back:
+                penalty = new_p * self._coord_penalty
+                reward -= penalty
+                info["coord_penalty"] = penalty
+                self._last_penalties = p_crossed
+            elif new_p > 0:
+                # warp_back 时跨过阈值通常是因为 max_x 在前几步刚被推过去，回传不另算扣分
+                self._last_penalties = p_crossed
+
         return obs, reward, terminated, truncated, info
 
 
@@ -423,7 +471,11 @@ def make_env(env_id=None):
             env,
             min_drop=WARP_BACK_MIN_DROP,
             milestones=MILESTONE_POINTS,
+            x_tolerance=MILESTONE_X_TOLERANCE,
             y_tolerance=MILESTONE_Y_TOLERANCE,
+            penalties=PENALTY_POINTS,
+            penalty_x_tolerance=PENALTY_X_TOLERANCE,
+            penalty_y_tolerance=PENALTY_Y_TOLERANCE,
         )
 
     env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
@@ -439,6 +491,7 @@ def make_env(env_id=None):
         speed_per_step=SPEED_BONUS_PER_STEP,
         step_penalty=STEP_PENALTY_SEEN,
         milestone_bonus=MILESTONE_BONUS,
+        coord_penalty=PENALTY_AMOUNT,
     )
     env = Monitor(env)
     return env
@@ -608,6 +661,7 @@ class EpisodeLogCallback(BaseCallback):
                 l = info["episode"]["l"]
                 max_x = int(info.get("max_x", 0))
                 ms = int(info.get("milestones_crossed", 0))
+                pen = int(info.get("penalties_crossed", 0))
                 if info.get("warp_back"):
                     suffix = "  [分支回传 drop={}]".format(int(info.get("warp_back_drop", 0)))
                 elif info.get("dead_loop"):
@@ -620,9 +674,10 @@ class EpisodeLogCallback(BaseCallback):
                 ec = getattr(self.model, "ent_coef", None)
                 ent_s = "ent={:.4f}".format(float(ec)) if ec is not None else "ent=N/A"
                 ms_tail = "  MS={}/{}".format(ms, len(MILESTONE_POINTS)) if ms > 0 else ""
+                pen_tail = "  PEN={}/{}".format(pen, len(PENALTY_POINTS)) if pen > 0 else ""
                 print(
-                    "Episode {:4d} | Reward: {:6.1f} | Steps: {} | MaxX: {} | Total Steps: {} | {} |{}{}".format(
-                        self.episode_count, r, int(l), max_x, total_env_steps, ent_s, suffix, ms_tail
+                    "Episode {:4d} | Reward: {:6.1f} | Steps: {} | MaxX: {} | Total Steps: {} | {} |{}{}{}".format(
+                        self.episode_count, r, int(l), max_x, total_env_steps, ent_s, suffix, ms_tail, pen_tail
                     )
                 )
         return True
@@ -710,8 +765,10 @@ def main():
         MARIO_ENV_ID, len(MOVEMENT_ACTIONS), FRAME_SKIP, NUM_ENVS))
     print("奖励: 正常步 clip(Δx,-3,+3) | 死亡-{} | 通关+{}+速度奖励(基准{}步,每省1步+{})".format(
         DEATH_PENALTY_SEEN, FLAG_GET_BONUS, SPEED_BONUS_BASE_STEPS, SPEED_BONUS_PER_STEP))
-    print("分支里程碑(PBRS): 点(x,y)={} y容差={} | 每到一个 +{:.0f}".format(
-        MILESTONE_POINTS, MILESTONE_Y_TOLERANCE, MILESTONE_BONUS))
+    print("分支里程碑(PBRS): 点(x,y)={} 容差x={},y={} | 每到一个 +{:.0f}".format(
+        MILESTONE_POINTS, MILESTONE_X_TOLERANCE, MILESTONE_Y_TOLERANCE, MILESTONE_BONUS))
+    print("减分坐标点: 点(x,y)={} 容差x={},y={} | 每到一个 -{:.0f}".format(
+        PENALTY_POINTS, PENALTY_X_TOLERANCE, PENALTY_Y_TOLERANCE, PENALTY_AMOUNT))
     print("本轮将再训练 {} 步".format(ADDITIONAL_TIMESTEPS))
     print("Episode 列 | ent=当前 PPO 熵系数（自适应回调会动态修改）")
     print("-" * 88)

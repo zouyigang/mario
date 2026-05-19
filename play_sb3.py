@@ -155,15 +155,8 @@ def _render_panel(panel_h, info, action, reward, total_reward,
         y0 += line_h
 
     components = [
-        ("y_layer",        info.get("y_layer_bonus_given", 0.0)),
-        ("cell_bonus",     info.get("cell_bonus_step", 0.0)),
-        ("frontier",       info.get("frontier_reward", 0.0)),
-        ("backtrack_new",  info.get("backtrack_new_cell_bonus", 0.0)),
-        ("backtrack_succ", info.get("backtrack_success_bonus", 0.0)),
-        ("post_layer_L",   info.get("post_layer_left_bonus", 0.0)),
-        ("flag_total",     info.get("flag_total_bonus", 0.0)),
-        ("death_penalty",  -float(info.get("death_penalty_applied", 0.0) or 0.0)
-                            if info.get("death_penalty_applied") else 0.0),
+        ("milestone",  info.get("milestone_bonus", 0.0)),
+        ("coord_pen",  -float(info.get("coord_penalty", 0.0) or 0.0)),
     ]
     named_sum = 0.0
     for name, val in components:
@@ -235,21 +228,13 @@ def _render_panel(panel_h, info, action, reward, total_reward,
     # ---- 累计统计 ----
     totals_lines = [
         ("-- episode totals --", PANEL_DIM),
-        ("max_x={:>5}  cells={:>4}".format(
-            int(info.get("episode_max_x", totals.get("max_x", 0)) or 0),
-            int(info.get("cells_visited", 0) or 0)), PANEL_FG),
-        ("ep_cell_bonus={}  stall_pen={}".format(
-            _fmt(info.get("episode_cell_bonus", 0.0), 7, 1, sign=False),
-            _fmt(info.get("episode_stall_penalty", 0.0), 6, 1, sign=False)), PANEL_FG),
-        ("sum_y_layer ={}  sum_cell  ={}".format(
-            _fmt(totals["y_layer"], 7, 1, sign=False),
-            _fmt(totals["cell_bonus"], 7, 1, sign=False)), PANEL_FG),
-        ("sum_post_L  ={}  sum_back_S={}".format(
-            _fmt(totals["post_layer_L"], 7, 1, sign=False),
-            _fmt(totals["backtrack_succ"], 7, 1, sign=False)), PANEL_FG),
-        ("sum_back_new={}  sum_front ={}".format(
-            _fmt(totals["backtrack_new"], 7, 1, sign=False),
-            _fmt(totals["frontier"], 7, 1, sign=False)), PANEL_FG),
+        ("max_x={:>5}  MS={}/{}".format(
+            int(info.get("max_x", totals.get("max_x", 0)) or 0),
+            int(info.get("milestones_crossed", 0) or 0),
+            int(info.get("milestones_total", 0) or 0)), PANEL_FG),
+        ("sum_milestone={}  sum_coord_pen={}".format(
+            _fmt(totals["milestone"], 7, 1, sign=False),
+            _fmt(totals["coord_pen"], 7, 1, sign=False)), PANEL_FG),
     ]
     for txt, col in totals_lines:
         if not _room(y0):
@@ -326,22 +311,14 @@ def _compose_window(game_rgb, panel_img):
 # ======================
 def _new_totals():
     return {
-        "y_layer": 0.0, "cell_bonus": 0.0, "frontier": 0.0,
-        "backtrack_new": 0.0, "backtrack_succ": 0.0, "post_layer_L": 0.0,
-        "flag_total": 0.0, "death_penalty": 0.0, "max_x": 0,
+        "milestone": 0.0, "coord_pen": 0.0, "max_x": 0,
     }
 
 
 def _update_totals(totals, info):
-    totals["y_layer"]        += float(info.get("y_layer_bonus_given", 0.0) or 0.0)
-    totals["cell_bonus"]     += float(info.get("cell_bonus_step", 0.0) or 0.0)
-    totals["frontier"]       += float(info.get("frontier_reward", 0.0) or 0.0)
-    totals["backtrack_new"]  += float(info.get("backtrack_new_cell_bonus", 0.0) or 0.0)
-    totals["backtrack_succ"] += float(info.get("backtrack_success_bonus", 0.0) or 0.0)
-    totals["post_layer_L"]   += float(info.get("post_layer_left_bonus", 0.0) or 0.0)
-    totals["flag_total"]     += float(info.get("flag_total_bonus", 0.0) or 0.0)
-    totals["death_penalty"]  += float(info.get("death_penalty_applied", 0.0) or 0.0)
-    mx = int(info.get("episode_max_x", 0) or 0)
+    totals["milestone"]  += float(info.get("milestone_bonus", 0.0) or 0.0)
+    totals["coord_pen"]  += float(info.get("coord_penalty", 0.0) or 0.0)
+    mx = int(info.get("max_x", 0) or 0)
     if mx > totals["max_x"]:
         totals["max_x"] = mx
 
@@ -349,21 +326,17 @@ def _update_totals(totals, info):
 def _collect_event_lines(step_idx, info, reward):
     out = []
     if info.get("flag_get"):
-        out.append("S{}: FLAG_GET (+{:.1f})".format(step_idx,
-                                                    float(info.get("flag_total_bonus", 0.0) or 0.0)))
+        out.append("S{}: FLAG_GET".format(step_idx))
+    if info.get("milestone_bonus"):
+        out.append("S{}: MILESTONE (+{:.1f})".format(
+            step_idx, float(info.get("milestone_bonus", 0.0) or 0.0)))
+    if info.get("coord_penalty"):
+        out.append("S{}: COORD_PENALTY (-{:.1f})".format(
+            step_idx, float(info.get("coord_penalty", 0.0) or 0.0)))
     if info.get("dead_loop"):
         out.append("S{}: DEAD_LOOP".format(step_idx))
-    if info.get("teleport_branch"):
-        out.append("S{}: TELEPORT".format(step_idx))
-    if info.get("backtrack_success"):
-        out.append("S{}: BACKTRACK_SUCC (+{:.1f})".format(
-            step_idx, float(info.get("backtrack_success_bonus", 0.0) or 0.0)))
-    if info.get("new_y_layer"):
-        out.append("S{}: NEW_Y_LAYER (+{:.1f})".format(
-            step_idx, float(info.get("y_layer_bonus_given", 0.0) or 0.0)))
-    if info.get("death_penalty_applied"):
-        out.append("S{}: DEATH (-{:.1f})".format(
-            step_idx, float(info.get("death_penalty_applied", 0.0) or 0.0)))
+    if info.get("warp_back"):
+        out.append("S{}: WARP_BACK".format(step_idx))
     return out
 
 
